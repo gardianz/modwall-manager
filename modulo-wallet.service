@@ -1,0 +1,20 @@
+[Unit]
+Description=Modulo wallet session keeper (headless, refresh-token based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these two paths for your VPS:
+WorkingDirectory=/opt/modulo-wallet
+ExecStart=/usr/bin/node /opt/modulo-wallet/keeper.mjs
+# wallets.json (with refresh tokens) + config.json (alerts) live in WorkingDirectory, chmod 600
+Restart=always
+RestartSec=60
+# harden a bit
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

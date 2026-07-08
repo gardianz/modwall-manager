@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 13px/1.4 system-ui, sans-serif; width: 340px; margin: 0; padding: 12px; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    button { font: inherit; padding: 7px 10px; border-radius: 7px; border: 1px solid #8884; cursor: pointer; background: #4f46e5; color: #fff; }
+    button.secondary { background: transparent; color: inherit; }
+    button:disabled { opacity: .5; cursor: default; }
+    .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .status { margin-top: 8px; padding: 7px 9px; border-radius: 7px; background: #8881; white-space: pre-wrap; word-break: break-word; }
+    .status.ok { background: #16a34a22; }
+    .status.err { background: #dc262622; }
+    textarea { width: 100%; height: 78px; margin-top: 8px; box-sizing: border-box; font: 11px/1.3 monospace; resize: vertical; }
+    .muted { opacity: .7; font-size: 11px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Modulo Session Grabber</h1>
+  <div class="row">
+    <button id="grab">Ambil Sesi</button>
+    <button id="copy" class="secondary" disabled>Copy JSON</button>
+    <button id="send" class="secondary" disabled>Kirim ke Bot</button>
+  </div>
+  <div id="status" class="status">Buka tab app.modulo.finance (sudah login), lalu klik "Ambil Sesi".</div>
+  <textarea id="out" placeholder="token muncul di sini" readonly></textarea>
+  <div class="muted">"Kirim ke Bot" butuh <code>node token-receiver.mjs</code> jalan di 127.0.0.1:8787.</div>
+  <script src="popup.js"></script>
+</body>
+</html>

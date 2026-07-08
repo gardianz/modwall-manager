@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Modulo Session Grabber",
+  "version": "1.0.0",
+  "description": "Ambil access_token + refresh_token sesi Modulo dari browser yang sudah login (tanpa login ulang) dan kirim ke bot lokal.",
+  "permissions": ["scripting", "activeTab", "tabs"],
+  "host_permissions": [
+    "https://app.modulo.finance/*",
+    "http://127.0.0.1:8787/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ambil Sesi Modulo"
+  }
+}

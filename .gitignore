@@ -1,0 +1,7 @@
+.env
+wallets.json
+config.json
+.browser-profile/
+node_modules/
+keeper.log
+.claude/

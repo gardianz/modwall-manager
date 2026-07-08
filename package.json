@@ -1,0 +1,26 @@
+{
+  "name": "modulo-wallet-keeper",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Interactive multi-wallet session keeper + health monitor for Modulo (app.modulo.finance, Auth0 JWT)",
+  "bin": {
+    "modulo-wallet": "cli.mjs"
+  },
+  "scripts": {
+    "start": "node cli.mjs",
+    "cli": "node cli.mjs",
+    "keeper": "node keeper.mjs",
+    "keeper:once": "node keeper.mjs --once",
+    "telegram": "node telegram.mjs",
+    "receiver": "node token-receiver.mjs",
+    "login": "node grab-token.mjs --login",
+    "grab": "node grab-token.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.61.0"
+  }
+}
