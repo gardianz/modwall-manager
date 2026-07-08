@@ -1,13 +1,75 @@
-# modulo-wallet-keeper
+# modwall-manager
 
 Interactive **multi-wallet** session keeper + health monitor for Modulo
 ([app.modulo.finance/portfolio](https://app.modulo.finance/portfolio)).
 
-- **CLI interaktif** (`cli.mjs`) — kelola banyak wallet: add (import sesi), lihat health, refresh, claim, hapus, atur alert.
+- **CLI interaktif** (`cli.mjs`) — kelola banyak wallet: add (import sesi), lihat health, refresh, claim, bulk send, atur alert.
 - **Session keeper** (`keeper.mjs`) — jalan headless di VPS, auto-refresh Auth0 token semua wallet, **alert Telegram/webhook kalau refresh token mati**.
 - **Browser extension** (`extension/`) + **receiver** (`token-receiver.mjs`) — impor sesi dari browser yang sudah login, tanpa login ulang.
+- **Telegram bot** (`telegram.mjs`) — kontrol semua fitur CLI dari Telegram.
 
-Single account per Google login. Bukan sybil tool.
+Bukan sybil tool.
+
+## Setup step-by-step
+
+**Prasyarat**: Node.js ≥ 18. Cek: `node --version`.
+
+```bash
+git clone https://github.com/gardianz/modwall-manager.git
+cd modwall-manager
+```
+
+Tidak ada dependency wajib (pakai Node built-in). `playwright` opsional (buat `grab-token.mjs`).
+
+### Langkah 1 — impor sesi wallet (di laptop, browser sudah login)
+
+Pilih salah satu:
+
+**Cara mudah (extension):**
+1. `node token-receiver.mjs` (biarkan jalan di terminal).
+2. Chrome → `chrome://extensions` → aktifkan **Developer mode** → **Load unpacked** → pilih folder `extension/`.
+3. Buka <https://app.modulo.finance/portfolio> (pastikan sudah login).
+4. Klik ikon extension → **Ambil Sesi** → **Kirim ke Bot**. Wallet masuk `wallets.json` otomatis.
+
+**Cara manual (paste):**
+1. `node cli.mjs` → `2) Add wallet`.
+2. Buka DevTools (F12) di tab Modulo → Application → Local Storage → `https://app.modulo.finance` → key `@@auth0spajs@@…` → salin isinya.
+3. Tempel di CLI. Ulangi untuk wallet lain (`Tambah wallet lagi? y`).
+
+> Pastikan ada **refresh_token** (biar bisa auto-refresh > 24 jam). Extension & localStorage sudah bawa refresh_token.
+
+### Langkah 2 — jalankan / kelola
+
+```bash
+node cli.mjs            # menu: list, detail, refresh, claim, bulk send, alerts
+```
+
+### Langkah 3 — (opsional) alert Telegram
+
+1. Chat @BotFather → `/newbot` → dapat **botToken**.
+2. Chat @userinfobot → dapat **chatId**.
+3. `node cli.mjs` → `8) Alerts` → isi botToken + chatId → `4) Test alert`.
+4. Kontrol via Telegram: `node telegram.mjs` → kirim `/menu` ke bot.
+
+### Langkah 4 — jaga sesi 24/7 di VPS
+
+Login tak bisa di VPS (Google blokir). Pola: impor di laptop → jalankan refresh_token di VPS.
+
+```bash
+# di VPS:
+git clone https://github.com/gardianz/modwall-manager.git && cd modwall-manager
+# salin wallets.json (berisi refresh_token) dari laptop ke sini, atau impor ulang via: node cli.mjs -> 2
+chmod 600 wallets.json config.json
+node keeper.mjs                 # loop selamanya + alert kalau RT mati
+```
+
+systemd (auto-start): lihat bagian [Running on a VPS](#running-on-a-vps-headless-no-display) di bawah.
+
+> ⚠️ **Jangan commit `wallets.json` / `config.json` / `.env`** — isinya token sesi (akses penuh wallet). Sudah gitignored.
+
+---
+
+Single account per Google login.
 
 ## Cara kerja auth (ringkas)
 
