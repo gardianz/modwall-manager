@@ -386,6 +386,78 @@ export async function pendingDailyWork(wallet, cfg) {
   };
 }
 
+/** UTC date key — the same clock the quest windows use. */
+export const utcDay = (now = Date.now()) => new Date(now).toISOString().slice(0, 10);
+
+/** Milliseconds until the next UTC midnight plus `offsetMin`, i.e. when a new quest day is live. */
+export function msUntilNextUtcDay(offsetMin = 5, now = Date.now()) {
+  const d = new Date(now);
+  const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, offsetMin, 0, 0);
+  return Math.max(1000, next - now);
+}
+
+const fmtWait = (ms) => {
+  const m = Math.round(ms / 60000);
+  return m >= 60 ? `${Math.floor(m / 60)}j${m % 60}m` : `${m}m`;
+};
+
+/**
+ * Run the auto task forever, one full pass per UTC day. Never exits just because a day's work
+ * is finished — it waits for the next quest window instead.
+ *
+ * Between full passes it still wakes every `loopRetryMin` to:
+ *   - claim anything the quest evaluator finished after our pass (claiming is free, and a
+ *     COMPLETED quest left unclaimed at the UTC boundary EXPIRES — this is the whole point)
+ *   - retry wallets whose pass errored, since the payout side is flaky per-asset
+ *
+ * `onPersist` is called after every wallet so rotated refresh tokens are never held in memory.
+ */
+export async function runAutoTasksLoop(selected, wallets, cfg, { onLog = noop, onPersist = noop } = {}) {
+  const at = cfg.autoTask;
+  const retryMs = Math.max(1, Number(at.loopRetryMin ?? 30)) * 60_000;
+  const offsetMin = Number(at.loopStartOffsetMin ?? 5);
+
+  for (;;) {
+    const day = utcDay();
+    onLog(`===== pass harian ${day} (UTC) — ${selected.length} wallet =====`);
+    const failed = new Set();
+    for (const w of selected) {
+      try {
+        const rep = await runAutoTasks(w, wallets, cfg, { onLog });
+        if (rep.errors.length) failed.add(w.id);
+      } catch (e) {
+        onLog(`${walletLabel(w)}: fatal ${e.message}`);
+        failed.add(w.id);
+      }
+      onPersist();
+    }
+
+    // Hold until the next quest window. Pinned to an absolute timestamp rather than "has the UTC
+    // day changed": a retry tick can land exactly on 00:00, which flips the day while the offset
+    // has not elapsed yet, and the next pass would then run before the new quests exist.
+    const nextStart = Date.now() + msUntilNextUtcDay(offsetMin);
+    for (;;) {
+      const untilNewDay = nextStart - Date.now();
+      const wait = Math.min(retryMs, untilNewDay);
+      onLog(`cek lagi ${fmtWait(wait)} · hari quest baru ${fmtWait(untilNewDay)} lagi${failed.size ? ` · ${failed.size} wallet perlu diulang` : ''}`);
+      await sleep(wait);
+      if (Date.now() >= nextStart) break; // new quest window -> full pass
+
+      for (const w of selected) {
+        try {
+          // free and time-critical: bank anything that finished since the last look
+          await claimAllQuests(w, cfg, { onLog: (m) => onLog(`${walletLabel(w)}: ${m}`) });
+          if (failed.has(w.id)) {
+            const rep = await runAutoTasks(w, wallets, cfg, { onLog });
+            if (!rep.errors.length) failed.delete(w.id);
+          }
+        } catch (e) { onLog(`${walletLabel(w)}: ${e.message}`); }
+        onPersist();
+      }
+    }
+  }
+}
+
 /**
  * Run the whole automated pass for one wallet:
  *   preapproval -> daily convert -> daily internal transfer -> settle wait -> claim.

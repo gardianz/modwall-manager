@@ -82,6 +82,11 @@ sama dengan fee. App cuma buka "Extend" saat `daysRemaining < 31` (dibulatkan ke
 saldo di app itu `balance > qty` (**strict**, bukan `>=`) — `pickSubscriptionPayment()` menirunya.
 Jangan extend saat status `REQUESTED`/`PENDING`/`AWAITING_PAYMENT` (pembayaran masih jalan).
 
+**Loop harian pakai timestamp absolut.** `runAutoTasksLoop()` menghitung `nextStart` sekali per
+hari lalu membandingkan `Date.now() >= nextStart`. Jangan diganti jadi cek "apakah `utcDay()`
+berubah" — tick retry bisa mendarat persis di 00:00, hari sudah berganti padahal
+`loopStartOffsetMin` belum lewat, dan pass berikutnya jalan sebelum quest baru ada di server.
+
 **Preapproval wajib duluan.** Token tanpa transfer-preapproval tidak bisa dikirim/diterima
 mulus dan tidak bisa jadi target convert. Itu sebabnya `runAutoTasks()` menjalankan langkah
 preapproval sebelum langkah yang memindahkan nilai.

@@ -13,7 +13,7 @@ import {
 } from './core.mjs';
 import {
   loadContext, preapproveAll, missingPreapprovals, previewConvert, pickConvertTarget,
-  convertPoints, resolvePeers, runAutoTasks, pendingDailyWork,
+  convertPoints, resolvePeers, runAutoTasks, runAutoTasksLoop, pendingDailyWork,
   planSubscriptionExtend, extendSubscription,
 } from './autotask.mjs';
 
@@ -325,10 +325,27 @@ async function autoTaskMenu() {
   console.log(`  dilewati : ${(at.skipSlugs || []).join(', ')}`);
   console.log(`  guard    : fee ${fmtUsd(at.maxFeeUsd)}/aksi | subscription ${fmtUsd(at.maxSubscriptionUsd)} (extend saat sisa <= ${at.extendWhenDaysLeft}d)`);
   console.log(`  lain     : transfer ${fmtUsd(at.internalTransferUsd)} | target convert ${(at.convertPreferSymbols || []).join('/')}`);
-  const mode = await ask('\n[1] Dry-run (lihat rencana, tidak eksekusi)  [2] Jalankan beneran  (kosong=batal): ');
-  if (mode !== '1' && mode !== '2') return;
+  console.log('\n  [1] Dry-run (lihat rencana, tidak eksekusi)');
+  console.log('  [2] Jalankan sekali');
+  console.log(`  [3] Loop harian (jalan terus, pass baru tiap 00:0${cfg.autoTask.loopStartOffsetMin} UTC)`);
+  const mode = await ask('Pilih (kosong=batal): ');
+  if (!['1', '2', '3'].includes(mode)) return;
   const dryRun = mode === '1';
   if (!dryRun && (await ask('Ketik "JALAN" untuk eksekusi beneran: ')) !== 'JALAN') { console.log('batal.'); return; }
+
+  if (mode === '3') {
+    console.log('\n================ LOOP HARIAN ================');
+    console.log('Jalan terus, tidak balik ke menu. Ctrl-C untuk stop.');
+    console.log(`Sela cek ${cfg.autoTask.loopRetryMin}m; pass penuh tiap hari quest baru (00:00 UTC = 07:00 WIB).`);
+    console.log('============================================\n');
+    rl.close();
+    await runAutoTasksLoop(sel, wallets, cfg, {
+      onLog: (m) => console.log(`[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${m}`),
+      onPersist: persist,
+    });
+    return;
+  }
+
   for (const w of sel) {
     console.log(`\n---------- ${walletLabel(w)} ----------`);
     try {
@@ -356,6 +373,8 @@ async function autoTaskSettings() {
     console.log(` [11] extendSubscription         : ${at.extendSubscription}`);
     console.log(` [12] extendWhenDaysLeft         : ${at.extendWhenDaysLeft}`);
     console.log(` [13] maxSubscriptionUsd (guard) : ${at.maxSubscriptionUsd}`);
+    console.log(` [14] loopRetryMin (sela cek)    : ${at.loopRetryMin}`);
+    console.log(` [15] loopStartOffsetMin         : ${at.loopStartOffsetMin} (menit setelah 00:00 UTC)`);
     console.log('  [0] Kembali');
     const a = await ask('Ubah nomor: ');
     const yn = async (q) => /^(y|1|true|on)/i.test(await ask(q));
@@ -372,6 +391,8 @@ async function autoTaskSettings() {
     else if (a === '11') at.extendSubscription = await yn('auto extend subscription? (y/n): ');
     else if (a === '12') { const v = parseInt(await ask(`extend saat sisa <= berapa hari (app buka window <${EXTEND_WINDOW_DAYS}d): `), 10); if (Number.isFinite(v) && v >= 0) at.extendWhenDaysLeft = v; }
     else if (a === '13') { const v = Number(await ask('max biaya subscription USD: ')); if (Number.isFinite(v) && v >= 0) at.maxSubscriptionUsd = v; }
+    else if (a === '14') { const v = parseInt(await ask('sela cek loop (menit): '), 10); if (Number.isFinite(v) && v >= 1) at.loopRetryMin = v; }
+    else if (a === '15') { const v = parseInt(await ask('mulai hari baru berapa menit setelah 00:00 UTC: '), 10); if (Number.isFinite(v) && v >= 0) at.loopStartOffsetMin = v; }
     else { persist(); return; }
     persist();
   }

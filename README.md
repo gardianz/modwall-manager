@@ -140,8 +140,36 @@ tidak keburu habis buat transfer.
 **Tidak pernah diotomasi**: `daily-swap` dan `daily-external-cip56-transfer` — keduanya butuh
 tujuan/pasangan yang kamu pilih sendiri dan biayanya paling besar. Ada di `skipSlugs` kalau mau diubah.
 
-Mode **dry-run** tersedia (pilihan `[1]`): tampilkan rencana lengkap + fee tanpa eksekusi apa pun.
-Eksekusi beneran butuh ketik `JALAN`.
+Tiga mode:
+
+| mode | kelakuan |
+|---|---|
+| `[1]` Dry-run | tampilkan rencana lengkap + fee, tidak eksekusi apa pun |
+| `[2]` Jalankan sekali | satu pass, lalu balik ke menu |
+| `[3]` Loop harian | jalan terus, satu pass penuh tiap hari quest baru |
+
+Eksekusi beneran (`[2]`/`[3]`) butuh ketik `JALAN`.
+
+### Loop harian
+
+`[3]` **tidak pernah berhenti** walau semua quest hari itu sudah selesai — dia menunggu window
+quest berikutnya. Jadwalnya dipatok ke **00:00 UTC + `loopStartOffsetMin`** (default 00:05 UTC =
+07:05 WIB), bukan "24 jam sejak terakhir jalan", supaya tidak ngambang menjauhi batas hari.
+
+Di sela dua pass penuh, tiap `loopRetryMin` (default 30 menit) dia bangun untuk:
+
+- **klaim** apa pun yang baru diselesaikan evaluator quest — gratis, dan quest `COMPLETED` yang
+  belum diklaim saat batas hari akan **hangus**, jadi ini justru inti gunanya;
+- **mengulang** wallet yang pass-nya error, karena sisi payout Modulo suka flaky per-aset.
+
+Sela ini murah: cuma cek quest, bukan pass penuh.
+
+```bash
+node cli.mjs   # -> 13 -> pilih wallet -> [3] -> JALAN
+```
+
+Buat 24/7 tanpa terminal nyala, pakai keeper + systemd (`autoTask.enabled = true`) — lihat
+bagian VPS di bawah.
 
 ### Guard fee
 
@@ -159,6 +187,8 @@ app (`baseUsd × (1 − diskon%) ÷ harga spot`, dibulatkan ke bawah).
 | `extendWhenDaysLeft` | extend kalau sisa ≤ segini hari | `3` |
 | `maxSubscriptionUsd` | plafon biaya subscription (USD) | `0.3` |
 | `settleWaitSec` | jeda sebelum claim / setelah convert | `25` |
+| `loopRetryMin` | sela cek di loop harian (menit) | `30` |
+| `loopStartOffsetMin` | mulai hari baru berapa menit setelah 00:00 UTC | `5` |
 | `skipSlugs` | quest yang tidak diotomasi | `daily-swap,daily-external-cip56-transfer` |
 
 > ⚠️ Fee transfer internal ($0.25 base, jadi ~$0.06 dengan diskon 75%) **lebih besar** dari nilai

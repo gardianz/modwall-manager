@@ -71,6 +71,8 @@ export function loadConfig() {
       extendWhenDaysLeft: 3,     // only extend once the subscription is this close to ending
       maxSubscriptionUsd: 0.3,   // hard guard for the subscription payment itself
       settleWaitSec: 25,         // pause before re-polling quests so the evaluator can catch up
+      loopRetryMin: 30,          // daily loop: how often to re-check inside the same UTC day
+      loopStartOffsetMin: 5,     // daily loop: start the new day this long after 00:00 UTC
       ...(d.autoTask || {}),
     },
     api: { ...(d.api || {}) },
