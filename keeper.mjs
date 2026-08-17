@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-// Headless session keeper for the VPS: refreshes all wallets, alerts when a refresh token dies.
+// Headless session keeper for the VPS: refreshes all wallets, runs the daily quest automation
+// when enabled, and alerts when a refresh token dies.
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   loadWallets, saveWallets, loadConfig,
-  refreshWallet, walletHealth, claimDaily,
-  tokenSecondsLeft, fmtDur, humanAmount, sendAlert, walletLabel, log, AuthError,
+  refreshWallet, walletHealth, fmtBalances,
+  tokenSecondsLeft, fmtDur, sendAlert, walletLabel, log, AuthError,
 } from './core.mjs';
+import { runAutoTasks } from './autotask.mjs';
 
-async function processWallet(w, cfg) {
+async function processWallet(w, wallets, cfg) {
   const label = walletLabel(w);
   const left = tokenSecondsLeft(w.accessToken);
   const skew = cfg.keeper.refreshSkewSec;
@@ -44,31 +46,33 @@ async function processWallet(w, cfg) {
     }
   }
 
-  // 2) health + optional claim
+  // 2) health
   try {
-    const { cc, mod, sub, reward } = await walletHealth(w, cfg);
-    const bal = (b) => b && !b._err ? `${humanAmount(b.totalBalance ?? b.balance, b.decimals ?? 10)} ${b.symbol}` : `err`;
+    const { balances, sub, points, counts } = await walletHealth(w, cfg);
     const days = sub && !sub._err && sub.endAt ? ((new Date(sub.endAt) - Date.now()) / 86400000).toFixed(1) : '?';
-    log(`${label}: ${bal(cc)} | ${bal(mod)} | sub ${sub?.status || '?'} (${days}d) | reward ${reward?.accruedQuantity ?? '?'}`);
+    log(`${label}: ${fmtBalances(balances)} | sub ${sub?.status || '?'} (${days}d) | poin ${points?.claimable?.pointsBalance ?? '?'} | quest siap ${counts?.active ?? '?'}`);
 
-    if (sub && !sub._err && Number(days) < 3 && !sub.autoRenew && !w.alertedSub) {
+    if (sub && !sub._err && Number(days) < 3 && !w.alertedSub) {
       w.alertedSub = true;
-      await sendAlert(cfg, `⏳ Modulo wallet "${label}": subscription habis ${days}d lagi & autoRenew OFF.`);
-    } else if (sub && !sub._err && (Number(days) >= 3 || sub.autoRenew)) w.alertedSub = false;
-
-    if (cfg.keeper.enableClaim && reward && !reward._err) {
-      const accrued = Number(reward.accruedQuantity ?? 0);
-      if (accrued > 0 && accrued >= (cfg.keeper.claimMin || 0)) {
-        try { await claimDaily(w, cfg); log(`${label}: claimed daily reward (${accrued})`); }
-        catch (e) { log(`${label}: claim failed: ${e.message}`); }
-      }
-    }
+      await sendAlert(cfg, `⏳ Modulo wallet "${label}": subscription habis ${days}d lagi.`);
+    } else if (sub && !sub._err && Number(days) >= 3) w.alertedSub = false;
   } catch (e) {
     if (e instanceof AuthError && !w.alertedDead) {
       w.dead = true; w.alertedDead = true; w.lastError = e.message;
       await sendAlert(cfg, `🔴 Modulo wallet "${label}": sesi invalid (${e.message}). Re-import sesi.`);
       log(`${label}: auth dead during health -> alerted`);
-    } else log(`${label}: health error: ${e.message}`);
+      return;
+    }
+    log(`${label}: health error: ${e.message}`);
+  }
+
+  // 3) daily quest automation (opt-in via config: autoTask.enabled)
+  if (!cfg.autoTask?.enabled) return;
+  try {
+    const rep = await runAutoTasks(w, wallets, cfg, { onLog: (m) => log(m) });
+    if (rep.errors.length) log(`${label}: auto task error: ${rep.errors.join(' | ')}`);
+  } catch (e) {
+    log(`${label}: auto task fatal: ${e.message}`);
   }
 }
 
@@ -76,8 +80,10 @@ async function cycle() {
   const cfg = loadConfig();
   const wallets = loadWallets();
   if (!wallets.length) { log('no wallets — add via `node cli.mjs`'); return { cfg, wallets }; }
-  for (const w of wallets) await processWallet(w, cfg);
-  saveWallets(wallets); // persist rotated tokens + alert flags
+  for (const w of wallets) {
+    await processWallet(w, wallets, cfg);
+    saveWallets(wallets); // persist rotated tokens as we go, not only at the end
+  }
   return { cfg, wallets };
 }
 
@@ -87,8 +93,9 @@ export async function runKeeper() {
   console.log('============================================\n');
   log('=== keeper start ===');
   let cfg = (await cycle()).cfg;
-  const min = cfg.keeper.checkEveryMin || 30;
+  if (cfg.autoTask?.enabled) log('auto task: ON');
   for (;;) {
+    const min = cfg.keeper.checkEveryMin || 30;
     log(`next check in ${min}m`);
     await sleep(min * 60 * 1000);
     try { cfg = (await cycle()).cfg; } catch (e) { log('cycle error:', e.message); }

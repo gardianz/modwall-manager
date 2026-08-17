@@ -3,8 +3,9 @@
 Interactive **multi-wallet** session keeper + health monitor for Modulo
 ([app.modulo.finance/portfolio](https://app.modulo.finance/portfolio)).
 
-- **CLI interaktif** (`cli.mjs`) — kelola banyak wallet: add (import sesi), lihat health, refresh, claim, bulk send, atur alert.
-- **Session keeper** (`keeper.mjs`) — jalan headless di VPS, auto-refresh Auth0 token semua wallet, **alert Telegram/webhook kalau refresh token mati**.
+- **CLI interaktif** (`cli.mjs`) — kelola banyak wallet: add (import sesi), lihat health, refresh, preapproval token, convert poin, claim quest, auto task, bulk send, atur alert.
+- **Auto task** (`autotask.mjs`) — kerjakan quest harian otomatis: klaim quest, enable preapproval, convert poin ke token diskon, extend subscription, daily internal transfer ke wallet sendiri.
+- **Session keeper** (`keeper.mjs`) — jalan headless di VPS, auto-refresh Auth0 token semua wallet, **alert Telegram/webhook kalau refresh token mati**, opsional jalankan auto task tiap siklus.
 - **Browser extension** (`extension/`) + **receiver** (`token-receiver.mjs`) — impor sesi dari browser yang sudah login, tanpa login ulang.
 - **Telegram bot** (`telegram.mjs`) — kontrol semua fitur CLI dari Telegram.
 
@@ -87,22 +88,97 @@ node cli.mjs            # menu interaktif
 
 Menu:
 ```
-1) List wallets        2) Add wallet (import)
-3) Detail wallet       4) Refresh token now
-5) Claim daily reward  6) Remove wallet
-7) Bulk send (transfer)  8) Alerts (Telegram/webhook)
-9) Keeper settings     10) Run keeper now      0) Exit
+ 1) List wallets            2) Add wallet (import)
+ 3) Detail wallet           4) Refresh token now
+ 5) Claim quest reward      6) Remove wallet
+ 7) Bulk send (transfer)    8) Alerts (Telegram/webhook)
+ 9) Keeper settings        10) Run keeper now
+11) Preapproval token      12) Convert poin -> token
+13) Auto task (jalankan)   14) Auto task settings
+15) Subscription (extend)   0) Exit
 ```
 
-Data disimpan di `wallets.json` (token) + `config.json` (alert/keeper), keduanya `chmod 600`, gitignored.
+Data disimpan di `wallets.json` (token) + `config.json` (alert/keeper/autoTask), keduanya `chmod 600`, gitignored.
 
-## Claim daily reward (manual, bukan auto)
+## Sistem reward: poin → convert → quest
 
-Menu `5) Claim` → pilih wallet (`1,3` / `all`) → tampil accrued per wallet → konfirmasi → klaim.
-Klaim **manual** (kamu yang trigger). Keeper **tidak** auto-claim kecuali kamu set `enableClaim=true`
-di `9) Keeper settings` (default off).
+Reward Modulo sekarang berbasis **poin**: kerjakan quest → dapat poin → convert poin jadi token.
 
-## Bulk send (transfer CC/MOD)
+- **`11) Preapproval token`** — sama dengan tombol **Enable** di halaman portfolio. Token tanpa
+  preapproval tidak bisa dikirim/diterima mulus dan **tidak bisa jadi target convert**. Menu ini
+  meng-enable semua token yang masih kurang, per wallet. Gratis (hanya transaksi on-chain).
+- **`12) Convert poin -> token`** — tampilkan tabel semua target: jumlah diterima, fee, nilai USD,
+  status preapproval. Pilih nomor, atau `auto` untuk saran. Minimum convert 50 poin, maksimum
+  1000 poin per klaim (dibaca dari API, bukan hardcode).
+- **`5) Claim quest reward`** — klaim semua quest berstatus `COMPLETED` di wallet terpilih.
+
+Fee convert = `claimFeeUsd` tier ($0.20 di tier Basic), **diskon 75% kalau target CBTC/cETH**.
+
+## Auto task (quest harian otomatis)
+
+`13) Auto task` menjalankan, per wallet, berurutan:
+
+1. **Claim awal** — klaim dulu semua quest yang sudah selesai, **sebelum** ngerjain apa pun.
+2. **Preapproval** semua token yang belum aktif.
+3. **Daily Convert** — poin → token. Target dipilih otomatis: token yang **diskon** (CBTC/cETH)
+   dan **yang sudah dipegang wallet** lebih dulu, biar saldo menumpuk di satu aset, bukan jadi debu.
+4. **Extend Subscription** — perpanjang tier yang sedang dipakai kalau sisanya sudah
+   ≤ `extendWhenDaysLeft`. Dibayar pakai token **diskon** (CBTC/cETH = 75% off, $1.00 → $0.25).
+5. **Daily Internal Transfer** — kirim CBTC/cETH senilai `internalTransferUsd` (default $0.01) ke
+   **wallet lain yang sudah diimpor ke bot**. Fee dibayar pakai token diskon.
+6. **Claim akhir** — klaim quest yang baru selesai (setelah jeda `settleWaitSec`, karena evaluator
+   quest jalan async).
+
+Urutannya disengaja: convert dulu supaya ada saldo, subscription sebelum transfer supaya saldonya
+tidak keburu habis buat transfer.
+
+> **Kenapa claim didahulukan?** Window quest harian tutup tepat di **tengah malam UTC**. Quest
+> berstatus `COMPLETED` yang belum diklaim saat window tutup langsung jadi `EXPIRED` dan poinnya
+> hangus. Jadi poin yang sudah kelihatan diamankan duluan, baru cari kerjaan baru.
+> Hindari juga menjalankan auto task persis menjelang 00:00 UTC (07:00 WIB).
+
+**Tidak pernah diotomasi**: `daily-swap` dan `daily-external-cip56-transfer` — keduanya butuh
+tujuan/pasangan yang kamu pilih sendiri dan biayanya paling besar. Ada di `skipSlugs` kalau mau diubah.
+
+Mode **dry-run** tersedia (pilihan `[1]`): tampilkan rencana lengkap + fee tanpa eksekusi apa pun.
+Eksekusi beneran butuh ketik `JALAN`.
+
+### Guard fee
+
+`14) Auto task settings` → `maxFeeUsd` (default **$0.30**). Setiap aksi yang estimasi fee-nya
+melebihi angka ini **dilewati**, bukan dijalankan. Estimasi memakai rumus yang sama persis dengan
+app (`baseUsd × (1 − diskon%) ÷ harga spot`, dibulatkan ke bawah).
+
+| setting | arti | default |
+|---|---|---|
+| `enabled` | auto task ikut jalan di dalam keeper | `false` |
+| `maxFeeUsd` | plafon fee per aksi (USD) | `0.3` |
+| `internalTransferUsd` | nilai transfer harian | `0.01` |
+| `convertPreferSymbols` | prioritas target convert | `CBTC,cETH` |
+| `extendSubscription` | auto perpanjang subscription | `true` |
+| `extendWhenDaysLeft` | extend kalau sisa ≤ segini hari | `3` |
+| `maxSubscriptionUsd` | plafon biaya subscription (USD) | `0.3` |
+| `settleWaitSec` | jeda sebelum claim / setelah convert | `25` |
+| `skipSlugs` | quest yang tidak diotomasi | `daily-swap,daily-external-cip56-transfer` |
+
+> ⚠️ Fee transfer internal ($0.25 base, jadi ~$0.06 dengan diskon 75%) **lebih besar** dari nilai
+> transfer default $0.01. Quest-nya bayar 10 poin (~$0.09). Cek sendiri apakah selisihnya masuk akal
+> buat kamu sebelum menyalakan langkah ini.
+
+## Subscription (extend manual)
+
+Menu `15) Subscription (extend)` — tampilkan tier, sisa hari, dan **semua opsi pembayaran** persis
+seperti dropdown di app: jumlah token, biaya USD, saldo cukup atau tidak, status preapproval.
+Saran otomatis = token dengan diskon terbesar yang saldonya cukup.
+
+Biaya = `costAmountUsd` tier × `(1 − subscriptionDiscountPercent/100) ÷ harga spot`.
+Basic $1.00/bln → **$0.25** kalau bayar pakai CBTC/cETH.
+
+App hanya membuka tombol Extend saat **sisa < 31 hari**; di luar itu menu ini menolak (bukan bug).
+Auto task pakai ambang lebih ketat (`extendWhenDaysLeft`, default 3 hari) supaya tidak
+memperpanjang kepagian. Tier tidak pernah diganti otomatis — upgrade/downgrade tetap manual.
+
+## Bulk send (transfer)
 
 Menu `7) Bulk send`. Pilih **sender** (satu/`1,3`/`all`) dan **receiver**:
 - **Wallet internal** — pilih dari daftar (multi). Alamat (partyId) diambil otomatis via `/api/auth/login`.
@@ -115,8 +191,10 @@ Aturan plan:
 | 1 | banyak | sender → tiap receiver (sebar) |
 | N | N | pasangan per-indeks (jumlah harus sama) |
 
-Asset `CC` (native) atau `MOD` (pakai `instrumentId`/`instrumentAdmin` otomatis).
-Jumlah = angka per transfer, atau `max` (kirim seluruh saldo). Preview plan → ketik `KIRIM` untuk eksekusi.
+Asset: `CBTC`, `cETH`, `CC`, `MOD`, `USDCx` (`instrumentId` diambil otomatis dari API).
+Jumlah = angka per transfer, atau `max`. Token pembayar fee dipilih otomatis (yang diskon dulu);
+kalau fee dibayar pakai token yang sama dengan yang dikirim, `max` otomatis menyisakan fee.
+Preview plan (termasuk fee per transfer) → ketik `KIRIM` untuk eksekusi.
 
 ## Telegram bot (fitur sama seperti CLI)
 
@@ -125,8 +203,13 @@ Set `botToken` + `chatId` di `8) Alerts`, lalu:
 node telegram.mjs
 ```
 Bot **hanya** merespon `chatId` yang di-authorize. Kirim `/menu` → tombol: Wallets, Detail,
-Refresh all, Claim, Send, Keeper. `/send` & `/claim` = alur multi-step (balas teks):
-- Send: pilih sender (`1,3`/`all`) → receiver (`w 1,2` atau `ext <partyId>`) → asset (`CC`/`MOD`) → jumlah (`1.5`/`max`) → `KIRIM`.
+Refresh all, Claim quest, Preapproval, Convert, Send, Auto task, Subscription, Keeper. Semuanya alur multi-step
+(balas teks):
+- Send: sender (`1,3`/`all`) → receiver (`w 1,2` atau `ext <partyId>`) → asset (`CBTC`) → jumlah (`0.0001`/`max`) → `KIRIM`.
+- Convert: pilih wallet → `AUTO` atau simbol target → `CONVERT`.
+- Preapproval: pilih wallet → `YA`.
+- Auto task: pilih wallet → bot balas **dry-run** dulu → `JALAN` untuk eksekusi.
+- Subscription: pilih wallet → bot balas rencana + biaya → `EXTEND`.
 - `/cancel` batalkan alur.
 
 Kalau `chatId` belum di-set, bot membalas id kamu supaya bisa dimasukkan ke config.
@@ -161,7 +244,7 @@ CLI menu `7) Alerts`:
 - **Webhook**: URL Discord/Slack/custom (dikirim JSON `{text, content, service, ts}`).
 - **Test alert** untuk verifikasi.
 
-Keeper mengirim alert saat: 🔴 refresh token **mati** (`invalid_grant`), ⚠️ token expired tanpa RT, ⏳ subscription <3 hari & autoRenew off, ✅ pulih. Alert **dedup** (sekali per transisi, tidak spam).
+Keeper mengirim alert saat: 🔴 refresh token **mati** (`invalid_grant`), ⚠️ token expired tanpa RT, ⏳ subscription <3 hari, ✅ pulih. Alert **dedup** (sekali per transisi, tidak spam).
 
 ## Jalan di VPS (headless)
 
@@ -198,16 +281,27 @@ Refresh token **rotasi**: sekali dipakai, yang lama mati; keeper simpan yang bar
 | file | fungsi |
 |---|---|
 | `cli.mjs` | menu interaktif (tool utama) |
-| `keeper.mjs` | keeper headless VPS + alert |
-| `telegram.mjs` | bot Telegram (fitur sama CLI: wallets/claim/send) |
-| `core.mjs` | shared: store, JWT, refresh, API, alert, transfer |
+| `keeper.mjs` | keeper headless VPS + alert + auto task opsional |
+| `telegram.mjs` | bot Telegram (fitur sama CLI) |
+| `core.mjs` | shared: store, JWT, refresh, API, instrument/balance/quest/rewards, fee math, transfer, alert |
+| `autotask.mjs` | orkestrasi quest: preapproval, convert, daily internal transfer, claim |
 | `token-receiver.mjs` | terima token dari extension → `wallets.json` |
 | `extension/` | Chrome MV3: ambil sesi dari browser |
 | `grab-token.mjs` | Playwright: login/grab dari profil browser |
-| `modulo-wallet.mjs` | (legacy) keeper single-`.env` |
+| `modulo-wallet.mjs` | (legacy, **usang**) keeper single-`.env`; masih pakai endpoint daily-reward yang sudah dihapus Modulo |
 | `modulo-wallet.service` | unit systemd |
 
 ## Endpoints (read-only kecuali ditandai)
-`GET /api/canton/balances` · `/api/canton/balances/mod` · `/api/subscription` ·
-`/api/daily-reward/user-daily-reward` · `/api/referrals/me` ·
-`POST /api/daily-reward/claim` (klaim) · `POST {auth0}/oauth/token` (refresh).
+
+`GET /api/canton/balances` · `/api/asset` · `/api/asset-blockchain` · `/api/subscription` ·
+`/api/subscription-tier` · `/api/rewards/user-points` · `/api/rewards/exchange-rates` ·
+`/api/user-quests[?status=active]` · `/api/user-quests/available` · `/api/user-quests/counts` ·
+`/api/canton/transfer-preapproval` · `/api/referrals/me` · `/api/user/profile`
+
+**Menulis:** `POST /api/auth/login` (ambil `partyId`) · `POST /api/canton/transfer-preapproval`
+(enable token) · `POST /api/rewards/point-exchange` (convert poin) ·
+`POST /api/user-quests/{progressId}/claim` (klaim quest) · `POST /api/canton/transfer` (kirim) ·
+`POST {auth0}/oauth/token` (refresh).
+
+> Endpoint reward lama (`/api/daily-reward/*`, `/api/canton/balances/mod`) sudah dihapus Modulo —
+> diganti sistem poin + quest di atas.

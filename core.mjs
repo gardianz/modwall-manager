@@ -1,7 +1,14 @@
 // Shared core for the Modulo wallet tools: config, JWT, Auth0 refresh, API, alerts.
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
+import dns from 'node:dns';
 import { fileURLToPath } from 'node:url';
+
+// Some hosts (WSL2 in particular) advertise IPv6 but cannot route it. Node's happy-eyeballs
+// then stalls on the API's AAAA record until ETIMEDOUT while curl works fine. Pin IPv4.
+try { net.setDefaultAutoSelectFamily(false); } catch { /* older node */ }
+try { dns.setDefaultResultOrder('ipv4first'); } catch { /* older node */ }
 
 export const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,6 +21,13 @@ export const DEFAULTS = {
   ORIGIN: 'https://app.modulo.finance',
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
 };
+
+/** Fee-instrument preference order used by the app itself (assets/instrument ids). */
+export const FEE_INSTRUMENT_ORDER = ['CBTC', 'cETH', 'USDCx', 'Amulet', 'MOD'];
+/** Quest slugs the auto-runner never attempts (cost/risk decided by the user). */
+export const DEFAULT_SKIP_SLUGS = ['daily-swap', 'daily-external-cip56-transfer'];
+/** The API caps this; larger values are rejected with 400. */
+export const QUEST_PAGE_SIZE = 50;
 
 export class AuthError extends Error {}
 
@@ -42,7 +56,23 @@ export function loadConfig() {
   return {
     alert: { telegram: { botToken: '', chatId: '' }, webhookUrl: '', ...(d.alert || {}),
       telegram: { botToken: '', chatId: '', ...((d.alert || {}).telegram || {}) } },
-    keeper: { checkEveryMin: 30, refreshSkewSec: 300, enableClaim: false, claimMin: 0, ...(d.keeper || {}) },
+    keeper: { checkEveryMin: 30, refreshSkewSec: 300, ...(d.keeper || {}) },
+    autoTask: {
+      enabled: false,            // run the auto-task pass inside the keeper loop
+      preapproveAll: true,       // grant transfer-preapproval for every active instrument
+      dailyConvert: true,        // points -> asset (daily-convert quest)
+      dailyInternalTransfer: true, // CIP-56 send to another imported wallet (daily-internal quest)
+      claimQuests: true,         // claim every COMPLETED quest
+      extendSubscription: true,  // renew/extend the current tier before it lapses
+      skipSlugs: [...DEFAULT_SKIP_SLUGS],
+      maxFeeUsd: 0.3,            // hard guard: never act when the estimated fee exceeds this
+      internalTransferUsd: 0.01, // size of the quest transfer, in USD
+      convertPreferSymbols: ['CBTC', 'cETH'], // discounted point-exchange targets
+      extendWhenDaysLeft: 3,     // only extend once the subscription is this close to ending
+      maxSubscriptionUsd: 0.3,   // hard guard for the subscription payment itself
+      settleWaitSec: 25,         // pause before re-polling quests so the evaluator can catch up
+      ...(d.autoTask || {}),
+    },
     api: { ...(d.api || {}) },
   };
 }
@@ -135,6 +165,13 @@ export async function refreshWallet(wallet, cfg) {
   return wallet;
 }
 
+/** Refresh only when the token is inside the skew window. */
+export async function ensureFresh(wallet, cfg) {
+  const skew = cfg?.keeper?.refreshSkewSec ?? 300;
+  if (tokenSecondsLeft(wallet.accessToken) < skew && wallet.refreshToken) await refreshWallet(wallet, cfg);
+  return wallet;
+}
+
 // --------------------------------------------------------------------------
 // api (per wallet), auto-refresh on 401/403
 // --------------------------------------------------------------------------
@@ -158,40 +195,83 @@ export async function api(wallet, method, ppath, body, cfg) {
   const txt = await res.text();
   let data; try { data = txt ? JSON.parse(txt) : null; } catch { data = txt; }
   if (res.status === 401 || res.status === 403) throw new AuthError(`${res.status} on ${method} ${ppath}`);
-  if (!res.ok) { const e = new Error(`${method} ${ppath} -> ${(data && data.error) || 'HTTP ' + res.status}`); e.status = res.status; throw e; }
+  if (!res.ok) {
+    const detail = (data && (data.message || data.error)) || `HTTP ${res.status}`;
+    const e = new Error(`${method} ${ppath} -> ${Array.isArray(detail) ? detail.join('; ') : detail}`);
+    e.status = res.status; e.data = data; throw e;
+  }
   return data;
 }
 
+// --------------------------------------------------------------------------
+// decimal helpers
+//
+// The API speaks *human* decimal strings ("0.0000805087"), not scaled integers.
+// Quantities are compared/added as BigInt units so nothing is lost to floats;
+// only USD/price arithmetic runs through Number, and always truncates like the app
+// (Decimal.ROUND_DOWN) so an estimate can never overstate what the user receives.
+// --------------------------------------------------------------------------
+function expandExponential(s) {
+  const m = /^(\d*)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(s);
+  if (!m) return s;
+  const [, w = '', f = '', e] = m;
+  const digits = w + f;
+  const point = w.length + parseInt(e, 10);
+  if (point <= 0) return '0.' + '0'.repeat(-point) + digits;
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return digits.slice(0, point) + '.' + digits.slice(point);
+}
+
+/** Decimal string -> BigInt units at `dec` places (truncating extra precision). */
+export function toUnits(value, dec = 10) {
+  let s = String(value ?? '0').trim();
+  if (!s || s === '-' || s === '.') return 0n;
+  let neg = false;
+  if (s.startsWith('+')) s = s.slice(1);
+  if (s.startsWith('-')) { neg = true; s = s.slice(1); }
+  if (/[eE]/.test(s)) s = expandExponential(s);
+  const [w = '0', f = ''] = s.split('.');
+  if (!/^\d*$/.test(w) || !/^\d*$/.test(f)) return 0n;
+  const frac = (f + '0'.repeat(dec)).slice(0, dec);
+  const v = BigInt(w || '0') * 10n ** BigInt(dec) + BigInt(frac || '0');
+  return neg ? -v : v;
+}
+
+/** BigInt units -> trimmed decimal string. */
+export function fromUnits(units, dec = 10) {
+  const neg = units < 0n;
+  const abs = neg ? -units : units;
+  const scale = 10n ** BigInt(dec);
+  const w = (abs / scale).toString();
+  let f = (abs % scale).toString().padStart(dec, '0').replace(/0+$/, '');
+  return (neg ? '-' : '') + w + (f ? '.' + f : '');
+}
+
+/** Number -> decimal string truncated (never rounded up) at `dec` places. */
+export function truncDecimals(value, dec = 10) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '0';
+  // toFixed with headroom, then cut: rounding at dec+6 cannot bubble into dec.
+  const s = expandExponential(Math.abs(n).toFixed(Math.min(100, dec + 6)));
+  const [w, f = ''] = s.split('.');
+  const out = fromUnits(toUnits(`${w}.${f}`, dec), dec);
+  return n < 0 && out !== '0' ? '-' + out : out;
+}
+
+/** Legacy: scaled-integer -> human string. Kept for old payloads; live balances are already human. */
 export function humanAmount(raw, decimals = 10) {
-  try {
-    const neg = String(raw).startsWith('-');
-    const s = String(raw).replace('-', '').padStart(decimals + 1, '0');
-    const whole = s.slice(0, s.length - decimals) || '0';
-    const frac = decimals ? s.slice(s.length - decimals).replace(/0+$/, '') : '';
-    return (neg ? '-' : '') + whole + (frac ? '.' + frac : '');
-  } catch { return String(raw); }
+  try { return fromUnits(BigInt(String(raw).replace(/\..*$/, '')), decimals); }
+  catch { return String(raw); }
 }
 
-/** Gather health for one wallet (ensures a fresh token first). Returns a summary object. */
-export async function walletHealth(wallet, cfg) {
-  const skew = (cfg?.keeper?.refreshSkewSec ?? 300);
-  if (tokenSecondsLeft(wallet.accessToken) < skew && wallet.refreshToken) await refreshWallet(wallet, cfg);
-  const [cc, mod, sub, reward, refs] = await Promise.all([
-    api(wallet, 'GET', '/api/canton/balances', undefined, cfg).catch((e) => ({ _err: e.message })),
-    api(wallet, 'GET', '/api/canton/balances/mod', undefined, cfg).catch((e) => ({ _err: e.message })),
-    api(wallet, 'GET', '/api/subscription', undefined, cfg).catch((e) => ({ _err: e.message })),
-    api(wallet, 'GET', '/api/daily-reward/user-daily-reward', undefined, cfg).catch((e) => ({ _err: e.message })),
-    api(wallet, 'GET', '/api/referrals/me', undefined, cfg).catch((e) => ({ _err: e.message })),
-  ]);
-  return { cc, mod, sub, reward, refs };
-}
-
-export async function claimDaily(wallet, cfg) {
-  return api(wallet, 'POST', '/api/daily-reward/claim', {}, cfg);
+export function fmtUsd(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '$?';
+  return '$' + (Math.abs(v) < 0.01 && v !== 0 ? v.toFixed(4) : v.toFixed(2));
 }
 
 // --------------------------------------------------------------------------
-// transfers (Canton): partyId = wallet address; asset admin from asset-blockchain
+// profile
 // --------------------------------------------------------------------------
 /** Get (and cache on the wallet) this wallet's Canton partyId = its receive address. */
 export async function getPartyId(wallet, cfg) {
@@ -202,35 +282,281 @@ export async function getPartyId(wallet, cfg) {
   return wallet.partyId;
 }
 
-/** Resolve asset transfer params for a symbol -> {symbol, decimals, native, instrumentId, instrumentAdmin}. */
-export async function resolveAsset(wallet, symbol, cfg) {
-  const sym = (symbol || 'CC').toUpperCase();
-  const assets = await api(wallet, 'GET', '/api/asset', undefined, cfg);
-  const a = (assets.assets || []).find((x) => x.symbol === sym);
-  if (!a) throw new Error(`asset ${sym} tidak ditemukan`);
-  const ab = await api(wallet, 'GET', '/api/asset-blockchain', undefined, cfg);
-  const meta = ((ab.assetBlockchains || []).find((x) => x.assetId === a.id) || {}).metadata || null;
-  return { symbol: sym, decimals: a.decimals, native: !!a.isNative, instrumentId: meta?.instrumentId, instrumentAdmin: meta?.instrumentAdmin };
-}
-
-/** Balance object for a symbol ({symbol, decimals, balance, totalBalance, ...}). */
-export async function balanceOf(wallet, symbol, cfg) {
-  const sym = (symbol || 'CC').toUpperCase();
-  return sym === 'MOD'
-    ? api(wallet, 'GET', '/api/canton/balances/mod', undefined, cfg)
-    : api(wallet, 'GET', '/api/canton/balances', undefined, cfg);
-}
-
-/** Send `amount` (human string) of `symbol` from wallet to receiverPartyId. */
-export async function transfer(wallet, { receiverPartyId, amount, symbol, memo }, cfg) {
-  const asset = await resolveAsset(wallet, symbol, cfg);
-  const body = { receiverPartyId: String(receiverPartyId).trim(), amount: String(amount) };
-  if (!asset.native) {
-    if (asset.instrumentId) body.instrumentId = asset.instrumentId;
-    if (asset.instrumentAdmin) body.instrumentAdmin = asset.instrumentAdmin;
+// --------------------------------------------------------------------------
+// instruments: /api/asset joined with /api/asset-blockchain metadata
+// --------------------------------------------------------------------------
+/**
+ * Instrument table keyed by symbol:
+ *   { symbol, instrumentId, decimals, isNative, isActive, canPointExchange,
+ *     feeDiscountPercent, subscriptionDiscountPercent, pointExchangeDiscountPercent, instrumentAdmin }
+ * Cached per wallet for the life of the process (the table changes rarely).
+ */
+const instrumentCache = new WeakMap();
+export async function getInstruments(wallet, cfg, { force = false } = {}) {
+  if (!force && instrumentCache.has(wallet)) return instrumentCache.get(wallet);
+  const [assetRes, abRes] = await Promise.all([
+    api(wallet, 'GET', '/api/asset', undefined, cfg),
+    api(wallet, 'GET', '/api/asset-blockchain', undefined, cfg),
+  ]);
+  const metaByAssetId = new Map();
+  for (const ab of abRes.assetBlockchains || []) {
+    if (ab.isActive) metaByAssetId.set(ab.assetId, ab.metadata || {});
   }
+  const out = {};
+  for (const a of assetRes.assets || []) {
+    const m = metaByAssetId.get(a.id) || {};
+    out[a.symbol] = {
+      symbol: a.symbol,
+      instrumentId: m.instrumentId || a.symbol,
+      decimals: a.decimals ?? 10,
+      isNative: !!a.isNative,
+      isActive: !!a.isActive,
+      canPointExchange: !!a.canPointExchange,
+      instrumentAdmin: m.instrumentAdmin,
+      feeDiscountPercent: Number(m.feeDiscountPercent ?? 0),
+      subscriptionDiscountPercent: Number(m.subscriptionDiscountPercent ?? 0),
+      pointExchangeDiscountPercent: Number(m.pointExchangeDiscountPercent ?? 0),
+    };
+  }
+  instrumentCache.set(wallet, out);
+  return out;
+}
+
+export function instrumentBySymbol(instruments, symbol) {
+  const key = Object.keys(instruments).find((s) => s.toLowerCase() === String(symbol || '').toLowerCase());
+  return key ? instruments[key] : null;
+}
+export function instrumentById(instruments, instrumentId) {
+  return Object.values(instruments).find((i) => i.instrumentId === instrumentId) || null;
+}
+
+// --------------------------------------------------------------------------
+// balances / preapproval
+// --------------------------------------------------------------------------
+/** { SYMBOL: { availableBalance, lockedBalance, totalBalance } } — human decimal strings. */
+export async function getBalances(wallet, cfg) {
+  const r = await api(wallet, 'GET', '/api/canton/balances', undefined, cfg);
+  return r?.balances || {};
+}
+export function availableOf(balances, symbol) {
+  return balances?.[symbol]?.availableBalance ?? '0';
+}
+
+/** Instrument ids this wallet has already preapproved for transfers. */
+export async function getPreapprovals(wallet, cfg) {
+  const r = await api(wallet, 'GET', '/api/canton/transfer-preapproval', undefined, cfg);
+  return Array.isArray(r?.instrumentIds) ? r.instrumentIds : [];
+}
+/** The app's "Enable" button. Idempotent server-side; returns { updateId }. */
+export async function grantPreapproval(wallet, instrumentId, cfg) {
+  return api(wallet, 'POST', '/api/canton/transfer-preapproval', { instrumentId }, cfg);
+}
+
+// --------------------------------------------------------------------------
+// rewards: points, exchange rates, point exchange ("Convert")
+// --------------------------------------------------------------------------
+export async function getPoints(wallet, cfg) {
+  const r = await api(wallet, 'GET', '/api/rewards/user-points', undefined, cfg);
+  return r?.claimable ? r : { claimable: {}, lifetime: {} };
+}
+/** { SYMBOL: { symbol, instrumentId, decimals, usdPerUnit, usdPerPoint, pointsPerUsd, ... } } */
+export async function getExchangeRates(wallet, cfg) {
+  const r = await api(wallet, 'GET', '/api/rewards/exchange-rates', undefined, cfg);
+  const out = {};
+  for (const a of r?.assets || []) out[a.symbol] = a;
+  return out;
+}
+/** Convert points -> asset. The server decides the amount (up to pointExchangeMaximumQtyPerClaim). */
+export async function exchangePoints(wallet, instrumentId, cfg) {
+  return api(wallet, 'POST', '/api/rewards/point-exchange', { instrumentId }, cfg);
+}
+
+// --------------------------------------------------------------------------
+// quests
+// --------------------------------------------------------------------------
+/** status: 'active' (claimable) | 'completed' | 'expired' | undefined (all). pageSize caps at 50. */
+export async function getQuests(wallet, cfg, { status } = {}) {
+  const q = new URLSearchParams();
+  if (status) q.set('status', status);
+  q.set('pageSize', String(QUEST_PAGE_SIZE));
+  const r = await api(wallet, 'GET', `/api/user-quests?${q}`, undefined, cfg);
+  return r?.quests || [];
+}
+export async function getAvailableQuests(wallet, cfg) {
+  const r = await api(wallet, 'GET', `/api/user-quests/available?pageSize=${QUEST_PAGE_SIZE}`, undefined, cfg);
+  return r?.quests || [];
+}
+export async function getQuestCounts(wallet, cfg) {
+  return api(wallet, 'GET', '/api/user-quests/counts', undefined, cfg);
+}
+/** Quests that are finished but not yet claimed (the app's "Claim" buttons). */
+export async function getClaimableQuests(wallet, cfg) {
+  const quests = await getQuests(wallet, cfg, { status: 'active' });
+  return quests.filter((q) => q.status === 'COMPLETED' && !q.isLocked && !q.claimedAt);
+}
+export async function claimQuest(wallet, progressId, cfg) {
+  return api(wallet, 'POST', `/api/user-quests/${progressId}/claim`, undefined, cfg);
+}
+
+// --------------------------------------------------------------------------
+// subscription
+// --------------------------------------------------------------------------
+export async function getSubscription(wallet, cfg) {
+  return api(wallet, 'GET', '/api/subscription', undefined, cfg);
+}
+export async function getSubscriptionTiers(wallet, cfg) {
+  const r = await api(wallet, 'GET', '/api/subscription-tier', undefined, cfg);
+  return r?.subscriptionTiers || [];
+}
+/** The tier row backing this wallet's subscription — carries every fee in USD. */
+export async function getMyTier(wallet, cfg) {
+  const [sub, tiers] = await Promise.all([
+    getSubscription(wallet, cfg).catch(() => null),
+    getSubscriptionTiers(wallet, cfg),
+  ]);
+  const tier = tiers.find((t) => t.id === sub?.tierId) || tiers.find((t) => t.name === 'Free') || null;
+  return { sub, tier, tiers };
+}
+
+/** Subscribe / renew / extend — one endpoint. instrumentId picks the payment token. */
+export async function subscribe(wallet, { tierId, instrumentId }, cfg) {
+  const body = { tierId };
+  if (instrumentId) body.instrumentId = instrumentId; // server default is "Amulet" (CC)
+  return api(wallet, 'POST', '/api/subscription/subscribe', body, cfg);
+}
+
+/** Statuses where a payment is already in flight — never start another one. */
+export const SUBSCRIPTION_PENDING = ['REQUESTED', 'PENDING', 'AWAITING_PAYMENT'];
+/** The app offers "Extend" while fewer than this many days remain. */
+export const EXTEND_WINDOW_DAYS = 31;
+const SUB_DAY_MS = 1440 * 60 * 1000;
+
+/** Days left, rounded UP like the app (0 = ended). */
+export function subscriptionDaysRemaining(sub, now = Date.now()) {
+  if (!sub?.endAt) return 0;
+  const ms = new Date(sub.endAt).getTime() - now;
+  return !Number.isFinite(ms) || ms <= 0 ? 0 : Math.ceil(ms / SUB_DAY_MS);
+}
+
+/** price = costUsd * max(0, 1 + modifier/100); modifier = -subscriptionDiscountPercent. */
+export function subscriptionPriceUsd(costAmountUsd, modifierPercent = 0) {
+  return Number(costAmountUsd) * Math.max(0, 1 + Number(modifierPercent) / 100);
+}
+export function subscriptionQuantity(costAmountUsd, modifierPercent, spotUsdPerUnit, decimals = 10) {
+  const spot = Number(spotUsdPerUnit);
+  if (!(spot > 0)) throw new Error('spot price must be positive');
+  return truncDecimals(subscriptionPriceUsd(costAmountUsd, modifierPercent) / spot, decimals);
+}
+
+/**
+ * Pick the token that pays for the subscription: biggest discount first, then the app's order.
+ * The app requires balance strictly greater than the payment quantity — matched here.
+ */
+export function pickSubscriptionPayment({
+  instruments, balances, preapproved, costAmountUsd, rates, prefer = FEE_INSTRUMENT_ORDER,
+}) {
+  const order = (i) => { const k = prefer.indexOf(i.instrumentId); return k < 0 ? prefer.length : k; };
+  const candidates = Object.values(instruments)
+    .filter((i) => i.isActive && Number(rates[i.symbol]?.usdPerUnit) > 0)
+    .sort((a, b) => (b.subscriptionDiscountPercent - a.subscriptionDiscountPercent) || (order(a) - order(b)));
+
+  for (const i of candidates) {
+    const modifier = -(i.subscriptionDiscountPercent || 0);
+    const qty = subscriptionQuantity(costAmountUsd, modifier, rates[i.symbol].usdPerUnit, i.decimals);
+    if (toUnits(availableOf(balances, i.symbol), i.decimals) <= toUnits(qty, i.decimals)) continue;
+    return {
+      symbol: i.symbol, instrumentId: i.instrumentId, decimals: i.decimals,
+      quantity: qty, usd: subscriptionPriceUsd(costAmountUsd, modifier),
+      discountPercent: i.subscriptionDiscountPercent,
+      preapproved: preapproved.includes(i.instrumentId),
+    };
+  }
+  return null;
+}
+
+// --------------------------------------------------------------------------
+// fee math — mirrors the app (feeModifierPercent = -discount, ROUND_DOWN)
+// --------------------------------------------------------------------------
+export const MODULO_PARTY_RE = /^modulo::1220[a-fA-F0-9]{64}$/;
+/** The app charges the *internal* fee for any well-formed modulo:: party id. */
+export function isModuloParty(p) { return MODULO_PARTY_RE.test(String(p || '').trim()); }
+
+/** feeUsd = baseUsd * max(0, 1 + modifierPercent/100). Discount d comes in as modifier -d. */
+export function feeUsdWithModifier(baseUsd, modifierPercent = 0) {
+  return Number(baseUsd) * Math.max(0, 1 + Number(modifierPercent) / 100);
+}
+/** Fee expressed in the fee instrument, truncated at its decimals. */
+export function feeQuantity(baseUsd, modifierPercent, spotUsdPerUnit, decimals = 10) {
+  const spot = Number(spotUsdPerUnit);
+  if (!(spot > 0)) throw new Error('spot price must be positive');
+  return truncDecimals(feeUsdWithModifier(baseUsd, modifierPercent) / spot, decimals);
+}
+/** Which USD fee applies to this destination. */
+export function transferFeeUsdFor(receiverPartyId, tier) {
+  return Number(isModuloParty(receiverPartyId) ? (tier?.internalTransferFeeUsd ?? 0) : (tier?.transferFeeUsd ?? 0));
+}
+
+/**
+ * Choose which token pays the fee: biggest discount first, then the app's own order.
+ * Mirrors the app's validity rule — when the fee token *is* the token being sent, the
+ * balance has to cover fee + amount, otherwise just the fee.
+ * Returns null when nothing qualifies.
+ */
+export function pickFeeInstrument({
+  instruments, balances, preapproved, baseUsd, rates,
+  transferInstrumentId = null, transferQuantity = '0', prefer = FEE_INSTRUMENT_ORDER,
+}) {
+  const order = (i) => { const k = prefer.indexOf(i.instrumentId); return k < 0 ? prefer.length : k; };
+  const candidates = Object.values(instruments)
+    .filter((i) => i.isActive && preapproved.includes(i.instrumentId) && Number(rates[i.symbol]?.usdPerUnit) > 0)
+    .sort((a, b) => (b.feeDiscountPercent - a.feeDiscountPercent) || (order(a) - order(b)));
+
+  for (const i of candidates) {
+    const modifier = -(i.feeDiscountPercent || 0);
+    const qty = feeQuantity(baseUsd, modifier, rates[i.symbol].usdPerUnit, i.decimals);
+    const need = toUnits(qty, i.decimals)
+      + (i.instrumentId === transferInstrumentId ? toUnits(transferQuantity, i.decimals) : 0n);
+    if (toUnits(availableOf(balances, i.symbol), i.decimals) < need) continue;
+    return {
+      symbol: i.symbol, instrumentId: i.instrumentId, decimals: i.decimals,
+      quantity: qty, usd: feeUsdWithModifier(baseUsd, modifier),
+      discountPercent: i.feeDiscountPercent,
+    };
+  }
+  return null;
+}
+
+// --------------------------------------------------------------------------
+// transfers
+// --------------------------------------------------------------------------
+/**
+ * Send `quantity` (human decimal string) of an instrument to a Canton party.
+ * Body per the live API: { receiverPartyId, quantity, instrumentId?, memo?, feeInstrumentId? }.
+ * The server computes and charges the fee itself; feeInstrumentId only picks which token pays.
+ * Legacy callers may still pass { amount, symbol } — both are accepted.
+ */
+export async function transfer(wallet, opts, cfg) {
+  const { receiverPartyId, memo, feeInstrumentId } = opts;
+  const quantity = String(opts.quantity ?? opts.amount ?? '').trim();
+  if (!quantity) throw new Error('quantity kosong');
+  let instrumentId = opts.instrumentId;
+  if (!instrumentId) {
+    const instruments = await getInstruments(wallet, cfg);
+    const inst = instrumentBySymbol(instruments, opts.symbol || 'CC');
+    if (!inst) throw new Error(`asset ${opts.symbol} tidak ditemukan`);
+    instrumentId = inst.instrumentId;
+  }
+  const body = { receiverPartyId: String(receiverPartyId).trim(), quantity, instrumentId };
   if (memo) body.memo = memo;
+  if (feeInstrumentId) body.feeInstrumentId = feeInstrumentId;
   return api(wallet, 'POST', '/api/canton/transfer', body, cfg);
+}
+
+/** Balance row for a symbol, kept for callers that ask per-asset. */
+export async function balanceOf(wallet, symbol, cfg) {
+  const balances = await getBalances(wallet, cfg);
+  const sym = Object.keys(balances).find((s) => s.toLowerCase() === String(symbol || 'CC').toLowerCase()) || symbol;
+  return { symbol: sym, ...(balances[sym] || { availableBalance: '0', lockedBalance: '0', totalBalance: '0' }) };
 }
 
 /**
@@ -248,6 +574,32 @@ export function planTransfers(senders, receivers, amount) {
     for (let i = 0; i < senders.length; i++) plan.push({ from: senders[i], to: receivers[i], amount });
   }
   return plan;
+}
+
+// --------------------------------------------------------------------------
+// health
+// --------------------------------------------------------------------------
+/** Snapshot for one wallet (ensures a fresh token first). Every field degrades to { _err }. */
+export async function walletHealth(wallet, cfg) {
+  await ensureFresh(wallet, cfg);
+  const safe = (p) => p.catch((e) => ({ _err: e.message }));
+  const [balances, sub, points, counts, refs] = await Promise.all([
+    safe(getBalances(wallet, cfg)),
+    safe(getSubscription(wallet, cfg)),
+    safe(getPoints(wallet, cfg)),
+    safe(getQuestCounts(wallet, cfg)),
+    safe(api(wallet, 'GET', '/api/referrals/me', undefined, cfg)),
+  ]);
+  return { balances, sub, points, counts, refs };
+}
+
+/** "0.0000805087 CBTC · 0 CC" style summary of the non-zero balances. */
+export function fmtBalances(balances, { all = false } = {}) {
+  if (!balances || balances._err) return `err(${balances?._err || '?'})`;
+  const rows = Object.entries(balances)
+    .filter(([, b]) => all || toUnits(b.totalBalance, 10) > 0n)
+    .map(([sym, b]) => `${b.totalBalance} ${sym}`);
+  return rows.length ? rows.join(' · ') : '(kosong)';
 }
 
 // --------------------------------------------------------------------------
