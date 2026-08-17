@@ -82,6 +82,12 @@ sama dengan fee. App cuma buka "Extend" saat `daysRemaining < 31` (dibulatkan ke
 saldo di app itu `balance > qty` (**strict**, bukan `>=`) — `pickSubscriptionPayment()` menirunya.
 Jangan extend saat status `REQUESTED`/`PENDING`/`AWAITING_PAYMENT` (pembayaran masih jalan).
 
+**Dashboard: ukur teks polos, warnai belakangan.** `dashboard.mjs` membangun tiap sel sebagai
+teks polos, memotong/mem-padding, baru menempel kode ANSI. Jangan pernah `padEnd()` string yang
+sudah berwarna — escape code ikut terhitung dan layout box langsung melenceng. `width()` juga
+menghitung CJK/emoji sebagai 2 kolom. Status panel dibaca lewat `onStatus` **di dalam** loop,
+bukan timer paralel: dua `refreshWallet()` bersamaan akan saling merotasi RT dan mematikan sesi.
+
 **Loop harian pakai timestamp absolut.** `runAutoTasksLoop()` menghitung `nextStart` sekali per
 hari lalu membandingkan `Date.now() >= nextStart`. Jangan diganti jadi cek "apakah `utcDay()`
 berubah" — tick retry bisa mendarat persis di 00:00, hari sudah berganti padahal

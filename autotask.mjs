@@ -8,6 +8,7 @@ import {
   getInstruments, instrumentBySymbol, instrumentById, getBalances, availableOf,
   getPreapprovals, grantPreapproval, getPoints, getExchangeRates, exchangePoints,
   getClaimableQuests, claimQuest, getQuests, getMyTier, getPartyId, transfer,
+  tokenSecondsLeft, fmtDur,
   pickFeeInstrument, feeQuantity, feeUsdWithModifier, transferFeeUsdFor, isModuloParty,
   subscribe, pickSubscriptionPayment, subscriptionDaysRemaining,
   SUBSCRIPTION_PENDING, EXTEND_WINDOW_DAYS, DEFAULT_SKIP_SLUGS,
@@ -386,6 +387,39 @@ export async function pendingDailyWork(wallet, cfg) {
   };
 }
 
+/**
+ * One row of live state per wallet, for the dashboard.
+ *
+ * Never throws: a wallet with a dead session still gets a row saying so, because a status
+ * panel that disappears when something breaks is worse than useless.
+ */
+export async function collectStatus(wallet, cfg) {
+  const row = { label: walletLabel(wallet), status: 'cek…', token: '-', poin: '-', quest: '-',
+    cbtc: '-', ceth: '-', sub: '-', convert: '-', xfer: '-', dead: false };
+  try { await ensureFresh(wallet, cfg); }
+  catch { row.status = 'SESI MATI'; row.dead = true; return row; }
+  row.token = fmtDur(tokenSecondsLeft(wallet.accessToken));
+  const grab = (p) => p.catch(() => null);
+  const [points, balances, tierInfo, pending] = await Promise.all([
+    grab(getPoints(wallet, cfg)), grab(getBalances(wallet, cfg)),
+    grab(getMyTier(wallet, cfg)), grab(pendingDailyWork(wallet, cfg)),
+  ]);
+  if (points) row.poin = points.claimable?.pointsBalance ?? '-';
+  if (balances) {
+    row.cbtc = balances.CBTC?.totalBalance ?? '0';
+    row.ceth = balances.cETH?.totalBalance ?? '0';
+  }
+  if (tierInfo?.sub) row.sub = `${subscriptionDaysRemaining(tierInfo.sub)}d`;
+  if (pending) {
+    row.quest = String(pending.claimable.length);
+    row.convert = pending.convertDone ? 'ok' : '-';
+    row.xfer = pending.internalDone ? 'ok' : '-';
+    row.status = pending.claimable.length ? 'siap klaim'
+      : (pending.convertDone && pending.internalDone) ? 'beres' : 'nunggu';
+  }
+  return row;
+}
+
 /** UTC date key — the same clock the quest windows use. */
 export const utcDay = (now = Date.now()) => new Date(now).toISOString().slice(0, 10);
 
@@ -412,25 +446,32 @@ const fmtWait = (ms) => {
  *
  * `onPersist` is called after every wallet so rotated refresh tokens are never held in memory.
  */
-export async function runAutoTasksLoop(selected, wallets, cfg, { onLog = noop, onPersist = noop } = {}) {
+export async function runAutoTasksLoop(selected, wallets, cfg, {
+  onLog = noop, onPersist = noop, onStatus = null, onSchedule = noop,
+} = {}) {
   const at = cfg.autoTask;
   const retryMs = Math.max(1, Number(at.loopRetryMin ?? 30)) * 60_000;
   const offsetMin = Number(at.loopStartOffsetMin ?? 5);
+  // Status reads share the wallet objects with the task steps, so they run here, between steps —
+  // never on a parallel timer. Two concurrent refreshes would rotate the refresh token against
+  // each other and kill the session for good.
+  const status = async () => { if (onStatus) { try { await onStatus(selected); } catch { /* panel only */ } } };
 
   for (;;) {
     const day = utcDay();
-    onLog(`===== pass harian ${day} (UTC) — ${selected.length} wallet =====`);
+    onLog(`===== pass harian ${day} (UTC) — ${selected.length} wallet =====`, 'head');
     const failed = new Set();
     for (const w of selected) {
       try {
         const rep = await runAutoTasks(w, wallets, cfg, { onLog });
         if (rep.errors.length) failed.add(w.id);
       } catch (e) {
-        onLog(`${walletLabel(w)}: fatal ${e.message}`);
+        onLog(`${walletLabel(w)}: fatal ${e.message}`, 'err');
         failed.add(w.id);
       }
       onPersist();
     }
+    await status();
 
     // Hold until the next quest window. Pinned to an absolute timestamp rather than "has the UTC
     // day changed": a retry tick can land exactly on 00:00, which flips the day while the offset
@@ -439,6 +480,7 @@ export async function runAutoTasksLoop(selected, wallets, cfg, { onLog = noop, o
     for (;;) {
       const untilNewDay = nextStart - Date.now();
       const wait = Math.min(retryMs, untilNewDay);
+      onSchedule({ nextStart, nextCheck: Date.now() + wait, failed: failed.size });
       onLog(`cek lagi ${fmtWait(wait)} · hari quest baru ${fmtWait(untilNewDay)} lagi${failed.size ? ` · ${failed.size} wallet perlu diulang` : ''}`);
       await sleep(wait);
       if (Date.now() >= nextStart) break; // new quest window -> full pass
@@ -451,9 +493,10 @@ export async function runAutoTasksLoop(selected, wallets, cfg, { onLog = noop, o
             const rep = await runAutoTasks(w, wallets, cfg, { onLog });
             if (!rep.errors.length) failed.delete(w.id);
           }
-        } catch (e) { onLog(`${walletLabel(w)}: ${e.message}`); }
+        } catch (e) { onLog(`${walletLabel(w)}: ${e.message}`, 'err'); }
         onPersist();
       }
+      await status();
     }
   }
 }

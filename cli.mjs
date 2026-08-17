@@ -14,8 +14,9 @@ import {
 import {
   loadContext, preapproveAll, missingPreapprovals, previewConvert, pickConvertTarget,
   convertPoints, resolvePeers, runAutoTasks, runAutoTasksLoop, pendingDailyWork,
-  planSubscriptionExtend, extendSubscription,
+  planSubscriptionExtend, extendSubscription, collectStatus,
 } from './autotask.mjs';
+import { Dashboard, colors } from './dashboard.mjs';
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -315,6 +316,86 @@ async function subscriptionMenu() {
   persist();
 }
 
+// ---- daily loop + dashboard ---------------------------------------------------
+const DASH_COLUMNS = [
+  { key: 'label', label: 'AKUN', w: 22, color: colors.title },
+  { key: 'status', label: 'STATUS', w: 11, color: (r) => (r.dead ? colors.err : r.status === 'beres' ? colors.ok : r.status === 'siap klaim' ? colors.warn : colors.dim) },
+  { key: 'token', label: 'TOKEN', w: 6, color: (r) => (r.dead ? colors.err : colors.dim) },
+  { key: 'poin', label: 'POIN', w: 9, align: 'r', color: colors.num },
+  { key: 'quest', label: 'QUEST', w: 5, align: 'r', color: (r) => (Number(r.quest) > 0 ? colors.warn : colors.dim) },
+  { key: 'cbtc', label: 'CBTC', w: 13, align: 'r', color: colors.accent },
+  { key: 'ceth', label: 'cETH', w: 13, align: 'r', color: colors.accent },
+  { key: 'sub', label: 'SUB', w: 5, align: 'r', color: (r) => (parseInt(r.sub, 10) <= 3 ? colors.err : colors.ok) },
+  { key: 'convert', label: 'CONVERT', w: 7, color: (r) => (r.convert === 'ok' ? colors.ok : colors.dim) },
+  { key: 'xfer', label: 'XFER', w: 4, color: (r) => (r.xfer === 'ok' ? colors.ok : colors.dim) },
+];
+
+/** Colour the log line from its own wording, so task code stays free of presentation concerns. */
+function logLevel(msg) {
+  if (/^=====/.test(msg)) return 'head';
+  if (/✓|claim ✓|sukses/i.test(msg)) return 'ok';
+  if (/✗|error|fatal|MATI|gagal/i.test(msg)) return 'err';
+  if (/skip|bermasalah|belum|tunggu/i.test(msg)) return 'warn';
+  return '';
+}
+
+async function runLoopWithDashboard(sel) {
+  if (!process.stdout.isTTY) { // piped/logged output: plain lines, no escape soup
+    console.log('(bukan TTY — pakai log biasa)');
+    await runAutoTasksLoop(sel, wallets, cfg, {
+      onLog: (m) => console.log(`[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${m}`),
+      onPersist: persist,
+    });
+    return;
+  }
+
+  const dash = new Dashboard({
+    title: 'modwall-manager · Auto Task',
+    subtitle: `${sel.length} wallet · guard fee ${fmtUsd(cfg.autoTask.maxFeeUsd)} · q berhenti`,
+    columns: DASH_COLUMNS,
+  });
+  let sched = null;
+  const wib = (t) => new Date(t).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false });
+  const left = (t) => { const m = Math.max(0, Math.round((t - Date.now()) / 60000)); return m >= 60 ? `${Math.floor(m / 60)}j${m % 60}m` : `${m}m`; };
+
+  const paintSummary = () => {
+    const rows = dash.rows;
+    const poin = rows.reduce((s, r) => s + (Number(r.poin) || 0), 0);
+    const siap = rows.reduce((s, r) => s + (Number(r.quest) || 0), 0);
+    const mati = rows.filter((r) => r.dead).length;
+    dash.setSummary([
+      `Total poin ${poin.toFixed(2)}  ·  quest siap klaim ${siap}  ·  wallet mati ${mati}`,
+      sched
+        ? `Pass berikutnya ${wib(sched.nextStart)} WIB (${left(sched.nextStart)})  ·  cek lagi ${left(sched.nextCheck)}${sched.failed ? `  ·  ${sched.failed} perlu diulang` : ''}`
+        : 'Pass pertama jalan…',
+    ]);
+  };
+
+  dash.on('quit', () => { dash.stop(); console.log('dihentikan.'); process.exit(0); });
+  const bye = () => { dash.stop(); process.exit(0); };
+  process.on('SIGINT', bye);
+  process.on('SIGTERM', bye);
+  dash.start();
+
+  try {
+    await runAutoTasksLoop(sel, wallets, cfg, {
+      onLog: (m, lvl) => dash.log(m, lvl || logLevel(m)),
+      onPersist: persist,
+      onSchedule: (s) => { sched = s; paintSummary(); },
+      onStatus: async (list) => {
+        const rows = [];
+        for (const w of list) rows.push(await collectStatus(w, cfg));
+        persist();
+        dash.setRows(rows);
+        paintSummary();
+        dash.render();
+      },
+    });
+  } finally {
+    dash.stop();
+  }
+}
+
 // ---- auto task ---------------------------------------------------------------
 async function autoTaskMenu() {
   const sel = await pickWallets('Wallet untuk auto task');
@@ -334,15 +415,8 @@ async function autoTaskMenu() {
   if (!dryRun && (await ask('Ketik "JALAN" untuk eksekusi beneran: ')) !== 'JALAN') { console.log('batal.'); return; }
 
   if (mode === '3') {
-    console.log('\n================ LOOP HARIAN ================');
-    console.log('Jalan terus, tidak balik ke menu. Ctrl-C untuk stop.');
-    console.log(`Sela cek ${cfg.autoTask.loopRetryMin}m; pass penuh tiap hari quest baru (00:00 UTC = 07:00 WIB).`);
-    console.log('============================================\n');
     rl.close();
-    await runAutoTasksLoop(sel, wallets, cfg, {
-      onLog: (m) => console.log(`[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${m}`),
-      onPersist: persist,
-    });
+    await runLoopWithDashboard(sel);
     return;
   }
 

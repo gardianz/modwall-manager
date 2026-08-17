@@ -168,6 +168,13 @@ Sela ini murah: cuma cek quest, bukan pass penuh.
 node cli.mjs   # -> 13 -> pilih wallet -> [3] -> JALAN
 ```
 
+Mode `[3]` membuka **dashboard layar penuh**: header, tabel per wallet (status, token, poin,
+quest siap klaim, saldo CBTC/cETH, sisa subscription, convert/transfer hari ini), ringkasan +
+hitung mundur pass berikutnya, dan log aktivitas bergulir. Tekan `q` untuk berhenti.
+
+Kalau output di-pipe ke file atau bukan TTY, otomatis balik ke log baris biasa — tidak ada
+sampah escape code di log.
+
 Buat 24/7 tanpa terminal nyala, pakai keeper + systemd (`autoTask.enabled = true`) — lihat
 bagian VPS di bawah.
 
@@ -314,7 +321,8 @@ Refresh token **rotasi**: sekali dipakai, yang lama mati; keeper simpan yang bar
 | `keeper.mjs` | keeper headless VPS + alert + auto task opsional |
 | `telegram.mjs` | bot Telegram (fitur sama CLI) |
 | `core.mjs` | shared: store, JWT, refresh, API, instrument/balance/quest/rewards, fee math, transfer, alert |
-| `autotask.mjs` | orkestrasi quest: preapproval, convert, daily internal transfer, claim |
+| `autotask.mjs` | orkestrasi quest: preapproval, convert, daily internal transfer, claim, loop harian |
+| `dashboard.mjs` | TUI ANSI: tabel + ringkasan + log (nol dependency) |
 | `token-receiver.mjs` | terima token dari extension → `wallets.json` |
 | `extension/` | Chrome MV3: ambil sesi dari browser |
 | `grab-token.mjs` | Playwright: login/grab dari profil browser |
