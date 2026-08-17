@@ -487,6 +487,10 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
 
       for (const w of selected) {
         try {
+          // Keeping the session alive is a job of the wait, not a side effect of it: refresh
+          // before the token lapses instead of letting a request 401 first. Sequential per
+          // wallet — never in parallel, or two refreshes rotate the RT against each other.
+          await ensureFresh(w, cfg);
           // free and time-critical: bank anything that finished since the last look
           await claimAllQuests(w, cfg, { onLog: (m) => onLog(`${walletLabel(w)}: ${m}`) });
           if (failed.has(w.id)) {
