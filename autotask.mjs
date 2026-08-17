@@ -139,11 +139,20 @@ export function pickConvertTarget(preview, opts = {}) {
 /**
  * Convert points into `symbol`, or into the best auto-picked target. Guarded by maxFeeUsd.
  *
- * Modulo returns 503 "Service temporarily unavailable" when the payout side for one specific
- * asset is down, while other assets keep working — so when no symbol was pinned we walk the
- * ranked targets instead of losing the day's convert to one sick asset. Only 5xx triggers a
- * fallback: a 4xx means the request itself is wrong and retrying elsewhere would just repeat it.
+ * The payout side is flaky per-asset: a healthy request can come back 503 "Service temporarily
+ * unavailable" or 400 "<asset> claim could not be completed. Please check claim status." while
+ * another asset — or the very same one moments later — succeeds. So we walk the ranked targets
+ * instead of losing the day's convert to one sick asset.
+ *
+ * Retrying a payout is only safe if the failed attempt moved nothing, and that message says the
+ * state is uncertain. So before each retry we re-read the points ledger: if totalPointsExchanged
+ * moved, the claim did land and we stop and report it instead of spending the points twice.
+ * A request-shape error (400 that is not the flaky claim message) never retries.
  */
+const FLAKY_CLAIM_RE = /claim could not be completed/i;
+function isRetryableClaimError(e) {
+  return e?.status >= 500 || (e?.status === 400 && FLAKY_CLAIM_RE.test(e.message || ''));
+}
 export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, onLog = noop, dryRun = false } = {}) {
   const c = ctx || (await loadContext(wallet, cfg));
   const preview = previewConvert(c);
@@ -169,19 +178,31 @@ export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, on
     return { skipped: `fee convert ${fmtUsd(targets[0].feeUsd)} > guard ${fmtUsd(maxFeeUsd)}` };
   }
 
+  // Ledger reading taken before any attempt, used to prove a failed attempt moved nothing.
+  const exchangedBefore = String(c.points?.lifetime?.totalPointsExchanged ?? '');
   const tried = [];
-  for (const [i, target] of affordable.entries()) {
+  // one extra pass so a flaky asset gets a second chance after the others were tried
+  const attempts = [...affordable, ...affordable.slice(0, 1)];
+
+  for (const [i, target] of attempts.entries()) {
     onLog(`convert ${preview.usePoints} poin -> ${target.net} ${target.symbol} (fee ${fmtUsd(target.feeUsd)}${target.discountPercent ? `, -${target.discountPercent}%` : ''})`);
     if (dryRun) return { dryRun: true, target, preview, fallbacks: affordable.slice(1).map((t) => t.symbol) };
     try {
       const res = await exchangePoints(wallet, target.instrumentId, cfg);
       return { ok: true, target, result: res, tried };
     } catch (e) {
-      const last = i === affordable.length - 1;
       tried.push(`${target.symbol}: ${e.message}`);
-      if (last || !(e.status >= 500)) throw e;
-      onLog(`  ${target.symbol} lagi bermasalah di server (${e.status}) — coba target berikutnya`);
-      await sleep(1500);
+      if (i === attempts.length - 1 || !isRetryableClaimError(e)) throw e;
+
+      // never spend the points twice: confirm the ledger did not move before retrying
+      const after = await getPoints(wallet, cfg).catch(() => null);
+      const exchangedAfter = String(after?.lifetime?.totalPointsExchanged ?? '');
+      if (after && exchangedBefore && exchangedAfter !== exchangedBefore) {
+        onLog(`  ${target.symbol} error tapi poin SUDAH terpotong — berhenti, jangan dobel. Cek status klaim di app.`);
+        return { uncertain: true, target, tried, exchangedBefore, exchangedAfter };
+      }
+      onLog(`  ${target.symbol} bermasalah di server (${e.status}), poin belum terpotong — coba lagi`);
+      await sleep(3000);
     }
   }
   return { skipped: tried.join(' | ') };
@@ -381,7 +402,15 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
     catch (e) { report.steps.push({ name, error: e.message }); report.errors.push(`${name}: ${e.message}`); say(`${name} error: ${e.message}`); return null; }
   };
 
-  await ensureFresh(wallet, cfg);
+  // A dead refresh token is a normal state in a multi-wallet run, not a crash: report it and
+  // let the caller move on to the next wallet.
+  try { await ensureFresh(wallet, cfg); }
+  catch (e) {
+    say(`sesi mati (${e.message}) — re-import wallet ini`);
+    report.errors.push(`sesi: ${e.message}`);
+    report.dead = true;
+    return report;
+  }
 
   // Claim FIRST. Quest windows close on the UTC day boundary, and a COMPLETED quest that is
   // still unclaimed when its window ends goes EXPIRED and the points are gone. Banking what is
