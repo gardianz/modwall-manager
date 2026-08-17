@@ -196,8 +196,8 @@ export async function api(wallet, method, ppath, body, cfg) {
   let data; try { data = txt ? JSON.parse(txt) : null; } catch { data = txt; }
   if (res.status === 401 || res.status === 403) throw new AuthError(`${res.status} on ${method} ${ppath}`);
   if (!res.ok) {
-    const detail = (data && (data.message || data.error)) || `HTTP ${res.status}`;
-    const e = new Error(`${method} ${ppath} -> ${Array.isArray(detail) ? detail.join('; ') : detail}`);
+    const detail = (data && (data.message || data.error)) || 'error';
+    const e = new Error(`${method} ${ppath} -> ${res.status} ${Array.isArray(detail) ? detail.join('; ') : detail}`);
     e.status = res.status; e.data = data; throw e;
   }
   return data;

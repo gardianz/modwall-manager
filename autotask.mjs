@@ -115,25 +115,35 @@ export function previewConvert({ instruments, points, rates, tier, preapproved }
 }
 
 /**
- * Pick the convert target: discounted assets first (currently CBTC/cETH at 75% off), and
- * among those the one the wallet already holds — so a wallet stacks one asset instead of dust.
+ * Rank convert targets best-first: discounted assets (currently CBTC/cETH at 75% off) ahead of
+ * the rest, and within a tier the asset the wallet already holds — so a wallet stacks one asset
+ * instead of collecting dust. Returns every eligible target, so a caller can fall back.
  */
-export function pickConvertTarget(preview, { balances, prefer = ['CBTC', 'cETH'] } = {}) {
+export function rankConvertTargets(preview, { balances, prefer = ['CBTC', 'cETH'] } = {}) {
   const eligible = preview.rows.filter((r) => r.preapproved && toUnits(r.net, r.decimals) > 0n);
-  if (!eligible.length) return null;
+  if (!eligible.length) return [];
   const wanted = prefer.map((s) => s.toLowerCase());
-  const discounted = eligible.filter((r) => r.discountPercent > 0 || wanted.includes(r.symbol.toLowerCase()));
-  const pool = discounted.length ? discounted : eligible;
-  const held = pool.filter((r) => toUnits(availableOf(balances, r.symbol), r.decimals) > 0n);
-  const rank = (r) => {
-    const p = wanted.indexOf(r.symbol.toLowerCase());
-    return p < 0 ? wanted.length : p;
-  };
-  const sortFn = (a, b) => (b.discountPercent - a.discountPercent) || (rank(a) - rank(b)) || (b.netUsd - a.netUsd);
-  return (held.length ? held : pool).sort(sortFn)[0];
+  const rank = (r) => { const p = wanted.indexOf(r.symbol.toLowerCase()); return p < 0 ? wanted.length : p; };
+  const held = (r) => (toUnits(availableOf(balances, r.symbol), r.decimals) > 0n ? 0 : 1);
+  const tier = (r) => (r.discountPercent > 0 || wanted.includes(r.symbol.toLowerCase()) ? 0 : 1);
+  return [...eligible].sort((a, b) =>
+    (tier(a) - tier(b)) || (held(a) - held(b)) ||
+    (b.discountPercent - a.discountPercent) || (rank(a) - rank(b)) || (b.netUsd - a.netUsd));
 }
 
-/** Convert points into `symbol` (or the auto-picked target). Guarded by maxFeeUsd. */
+/** Best single target (first of the ranked list). */
+export function pickConvertTarget(preview, opts = {}) {
+  return rankConvertTargets(preview, opts)[0] || null;
+}
+
+/**
+ * Convert points into `symbol`, or into the best auto-picked target. Guarded by maxFeeUsd.
+ *
+ * Modulo returns 503 "Service temporarily unavailable" when the payout side for one specific
+ * asset is down, while other assets keep working — so when no symbol was pinned we walk the
+ * ranked targets instead of losing the day's convert to one sick asset. Only 5xx triggers a
+ * fallback: a 4xx means the request itself is wrong and retrying elsewhere would just repeat it.
+ */
 export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, onLog = noop, dryRun = false } = {}) {
   const c = ctx || (await loadContext(wallet, cfg));
   const preview = previewConvert(c);
@@ -141,20 +151,40 @@ export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, on
   if (!preview.canExchange) {
     return { skipped: `poin ${preview.pointsBalance} < minimum ${preview.minPoints}` };
   }
-  const target = symbol
-    ? preview.rows.find((r) => r.symbol.toLowerCase() === String(symbol).toLowerCase())
-    : pickConvertTarget(preview, { balances: c.balances, prefer: cfg.autoTask.convertPreferSymbols });
-  if (!target) return { skipped: 'tidak ada target convert yang layak (cek preapproval)' };
-  if (!target.preapproved) return { skipped: `${target.symbol} belum preapproved — jalankan menu preapproval dulu` };
+
+  let targets;
+  if (symbol) {
+    const one = preview.rows.find((r) => r.symbol.toLowerCase() === String(symbol).toLowerCase());
+    if (!one) return { skipped: `target ${symbol} tidak tersedia` };
+    if (!one.preapproved) return { skipped: `${one.symbol} belum preapproved — jalankan menu preapproval dulu` };
+    targets = [one];
+  } else {
+    targets = rankConvertTargets(preview, { balances: c.balances, prefer: cfg.autoTask.convertPreferSymbols });
+  }
+  if (!targets.length) return { skipped: 'tidak ada target convert yang layak (cek preapproval)' };
 
   const maxFeeUsd = Number(cfg.autoTask.maxFeeUsd ?? Infinity);
-  if (target.feeUsd > maxFeeUsd) {
-    return { skipped: `fee convert ${fmtUsd(target.feeUsd)} > guard ${fmtUsd(maxFeeUsd)}` };
+  const affordable = targets.filter((t) => t.feeUsd <= maxFeeUsd);
+  if (!affordable.length) {
+    return { skipped: `fee convert ${fmtUsd(targets[0].feeUsd)} > guard ${fmtUsd(maxFeeUsd)}` };
   }
-  onLog(`convert ${preview.usePoints} poin -> ${target.net} ${target.symbol} (fee ${fmtUsd(target.feeUsd)}${target.discountPercent ? `, -${target.discountPercent}%` : ''})`);
-  if (dryRun) return { dryRun: true, target, preview };
-  const res = await exchangePoints(wallet, target.instrumentId, cfg);
-  return { ok: true, target, result: res };
+
+  const tried = [];
+  for (const [i, target] of affordable.entries()) {
+    onLog(`convert ${preview.usePoints} poin -> ${target.net} ${target.symbol} (fee ${fmtUsd(target.feeUsd)}${target.discountPercent ? `, -${target.discountPercent}%` : ''})`);
+    if (dryRun) return { dryRun: true, target, preview, fallbacks: affordable.slice(1).map((t) => t.symbol) };
+    try {
+      const res = await exchangePoints(wallet, target.instrumentId, cfg);
+      return { ok: true, target, result: res, tried };
+    } catch (e) {
+      const last = i === affordable.length - 1;
+      tried.push(`${target.symbol}: ${e.message}`);
+      if (last || !(e.status >= 500)) throw e;
+      onLog(`  ${target.symbol} lagi bermasalah di server (${e.status}) — coba target berikutnya`);
+      await sleep(1500);
+    }
+  }
+  return { skipped: tried.join(' | ') };
 }
 
 // --------------------------------------------------------------------------
