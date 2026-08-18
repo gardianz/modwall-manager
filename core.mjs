@@ -67,6 +67,9 @@ export function loadConfig() {
       skipSlugs: [...DEFAULT_SKIP_SLUGS],
       maxFeeUsd: 0.3,            // hard guard: never act when the estimated fee exceeds this
       internalTransferUsd: 0.01, // size of the quest transfer, in USD
+      fundSubscription: true,    // top a wallet up from a peer when it cannot pay its renewal
+      maxFundingUsd: 0.5,        // hard guard on one top-up transfer
+      fundingMarginPercent: 30,  // send this much extra, so spot drift cannot undershoot
       convertPreferSymbols: ['CBTC', 'cETH'], // discounted point-exchange targets
       convertOnlyDiscounted: true, // never fall back to a non-discounted payout asset
       extendWhenDaysLeft: 3,     // only extend once the subscription is this close to ending
@@ -449,6 +452,26 @@ export function subscriptionQuantity(costAmountUsd, modifierPercent, spotUsdPerU
   const spot = Number(spotUsdPerUnit);
   if (!(spot > 0)) throw new Error('spot price must be positive');
   return truncDecimals(subscriptionPriceUsd(costAmountUsd, modifierPercent) / spot, decimals);
+}
+
+/**
+ * What each active instrument would cost to pay one subscription, ignoring balances.
+ * Sorted biggest-discount first. Used to size a top-up before the wallet can pay at all.
+ */
+export function quoteSubscriptionPayments({ instruments, costAmountUsd, rates, prefer = FEE_INSTRUMENT_ORDER }) {
+  const order = (i) => { const k = prefer.indexOf(i.instrumentId); return k < 0 ? prefer.length : k; };
+  return Object.values(instruments)
+    .filter((i) => i.isActive && Number(rates[i.symbol]?.usdPerUnit) > 0)
+    .sort((a, b) => (b.subscriptionDiscountPercent - a.subscriptionDiscountPercent) || (order(a) - order(b)))
+    .map((i) => {
+      const modifier = -(i.subscriptionDiscountPercent || 0);
+      return {
+        symbol: i.symbol, instrumentId: i.instrumentId, decimals: i.decimals,
+        quantity: subscriptionQuantity(costAmountUsd, modifier, rates[i.symbol].usdPerUnit, i.decimals),
+        usd: subscriptionPriceUsd(costAmountUsd, modifier),
+        discountPercent: i.subscriptionDiscountPercent,
+      };
+    });
 }
 
 /**

@@ -10,7 +10,7 @@ import {
   getClaimableQuests, claimQuest, getQuests, getMyTier, getPartyId, transfer,
   tokenSecondsLeft, fmtDur,
   pickFeeInstrument, feeQuantity, feeUsdWithModifier, transferFeeUsdFor, isModuloParty,
-  subscribe, pickSubscriptionPayment, subscriptionDaysRemaining,
+  subscribe, pickSubscriptionPayment, quoteSubscriptionPayments, subscriptionDaysRemaining,
   SUBSCRIPTION_PENDING, EXTEND_WINDOW_DAYS, DEFAULT_SKIP_SLUGS,
 } from './core.mjs';
 
@@ -274,7 +274,7 @@ export async function planSubscriptionExtend(wallet, cfg, { ctx = null, force = 
     instruments: c.instruments, balances: c.balances, preapproved: c.preapproved,
     costAmountUsd: costUsd, rates: c.rates, prefer: cfg.autoTask.subscriptionPayPrefer,
   });
-  if (!pay) return { skipped: 'tidak ada token dengan saldo cukup untuk bayar subscription' };
+  if (!pay) return { skipped: 'tidak ada token dengan saldo cukup untuk bayar subscription', reason: 'insufficient-balance' };
 
   const guard = Number(cfg.autoTask.maxSubscriptionUsd ?? Infinity);
   if (pay.usd > guard) return { skipped: `biaya ${fmtUsd(pay.usd)} > guard ${fmtUsd(guard)}` };
@@ -282,10 +282,86 @@ export async function planSubscriptionExtend(wallet, cfg, { ctx = null, force = 
   return { plan: { tier, tierId: tier.id, days, costUsd, pay } };
 }
 
+/**
+ * Size a top-up for a wallet that cannot pay its own renewal, and find a peer to send it.
+ *
+ * Renewal must be paid with a DISCOUNTED asset (CBTC/cETH at 75% off: $1.00 -> $0.25), so the
+ * top-up is denominated in that same asset — funding a wallet with CC would only let it pay the
+ * full $1.00 price. A margin is added because spot drifts between this quote and the moment the
+ * server actually charges, and the app requires balance strictly greater than the price.
+ *
+ * The receiver must already have that instrument preapproved, otherwise the transfer lands as a
+ * pending instruction and the renewal still cannot go through.
+ */
+export async function planSubscriptionFunding(wallet, peers, cfg, { ctx = null } = {}) {
+  const c = ctx || (await loadContext(wallet, cfg));
+  const { sub, tier } = c;
+  if (!sub || !tier) return { skipped: 'tidak ada subscription/tier' };
+  const costUsd = Number(tier.costAmountUsd ?? 0);
+  if (!(costUsd > 0)) return { skipped: 'tier gratis' };
+
+  const quotes = quoteSubscriptionPayments({
+    instruments: c.instruments, costAmountUsd: costUsd, rates: c.rates,
+    prefer: cfg.autoTask.subscriptionPayPrefer,
+  }).filter((q) => q.discountPercent > 0 && c.preapproved.includes(q.instrumentId));
+  if (!quotes.length) return { skipped: 'tidak ada aset diskon yang sudah preapproved di wallet ini' };
+
+  const margin = 1 + Number(cfg.autoTask.fundingMarginPercent ?? 30) / 100;
+  const maxUsd = Number(cfg.autoTask.maxFundingUsd ?? Infinity);
+  const tried = [];
+
+  for (const q of quotes) {
+    const have = toUnits(availableOf(c.balances, q.symbol), q.decimals);
+    const want = toUnits(truncDecimals(Number(q.quantity) * margin, q.decimals), q.decimals);
+    if (have > toUnits(q.quantity, q.decimals)) return { skipped: `saldo ${q.symbol} sudah cukup` };
+    const shortUnits = want - have;
+    const short = fromUnits(shortUnits > 0n ? shortUnits : 0n, q.decimals);
+    const shortUsd = Number(short) * Number(c.rates[q.symbol].usdPerUnit);
+    if (shortUsd > maxUsd) { tried.push(`${q.symbol}: butuh ${fmtUsd(shortUsd)} > guard ${fmtUsd(maxUsd)}`); continue; }
+
+    for (const peer of peers) {
+      const pctx = await loadContext(peer.wallet, cfg).catch(() => null);
+      if (!pctx) continue;
+      const inst = instrumentBySymbol(pctx.instruments, q.symbol);
+      if (!inst || !pctx.preapproved.includes(inst.instrumentId)) continue;
+      const fee = pickFeeInstrument({
+        instruments: pctx.instruments, balances: pctx.balances, preapproved: pctx.preapproved,
+        baseUsd: transferFeeUsdFor(peer.partyId, pctx.tier), rates: pctx.rates,
+        transferInstrumentId: inst.instrumentId, transferQuantity: short,
+        prefer: cfg.autoTask.feeInstrumentPref,
+      });
+      if (!fee) continue;
+      if (fee.usd > Number(cfg.autoTask.maxFeeUsd ?? Infinity)) { tried.push(`${peer.label}: fee ${fmtUsd(fee.usd)} > guard`); continue; }
+      const need = toUnits(short, q.decimals)
+        + (fee.instrumentId === inst.instrumentId ? toUnits(fee.quantity, fee.decimals) : 0n);
+      if (toUnits(availableOf(pctx.balances, q.symbol), q.decimals) < need) {
+        tried.push(`${peer.label}: ${q.symbol} kurang`); continue;
+      }
+      return { plan: { symbol: q.symbol, instrumentId: inst.instrumentId, decimals: q.decimals,
+        quantity: short, usd: shortUsd, price: q, donor: peer, fee } };
+    }
+    tried.push(`${q.symbol}: tidak ada wallet donor yang sanggup`);
+  }
+  return { skipped: tried.join(' | ') || 'tidak ada jalur pendanaan' };
+}
+
+/** Send the top-up so this wallet can pay its own renewal. */
+export async function fundSubscription(wallet, peers, cfg, { ctx = null, onLog = noop, dryRun = false } = {}) {
+  const { plan, skipped } = await planSubscriptionFunding(wallet, peers, cfg, { ctx });
+  if (!plan) return { skipped };
+  onLog(`talangi renew: ${plan.donor.label} kirim ${plan.quantity} ${plan.symbol} (${fmtUsd(plan.usd)}), fee ${plan.fee.quantity} ${plan.fee.symbol} (${fmtUsd(plan.fee.usd)}${plan.fee.discountPercent ? `, -${plan.fee.discountPercent}%` : ''})`);
+  if (dryRun) return { dryRun: true, plan };
+  const res = await transfer(plan.donor.wallet, {
+    receiverPartyId: wallet.partyId || (await getPartyId(wallet, cfg)),
+    quantity: plan.quantity, instrumentId: plan.instrumentId, feeInstrumentId: plan.fee.instrumentId,
+  }, cfg);
+  return { ok: true, plan, result: res };
+}
+
 /** Execute the extend. */
 export async function extendSubscription(wallet, cfg, { ctx = null, onLog = noop, dryRun = false, force = false } = {}) {
-  const { plan, skipped } = await planSubscriptionExtend(wallet, cfg, { ctx, force });
-  if (!plan) return { skipped };
+  const { plan, skipped, reason } = await planSubscriptionExtend(wallet, cfg, { ctx, force });
+  if (!plan) return { skipped, reason };
   onLog(`extend "${plan.tier.name}" (sisa ${plan.days}d) bayar ${plan.pay.quantity} ${plan.pay.symbol} = ${fmtUsd(plan.pay.usd)}${plan.pay.discountPercent ? ` (-${plan.pay.discountPercent}%, normal ${fmtUsd(plan.costUsd)})` : ''}`);
   if (dryRun) return { dryRun: true, plan };
   const res = await subscribe(wallet, { tierId: plan.tierId, instrumentId: plan.pay.instrumentId }, cfg);
@@ -616,7 +692,28 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
   // Subscription before the transfer: the transfer would otherwise drain the balance that pays
   // for it, and a lapsed subscription stops the quests that make the rest of this worthwhile.
   await step('extend-subscription', at.extendSubscription, async () => {
-    const r = await extendSubscription(wallet, cfg, { ctx: funded, onLog: say, dryRun });
+    let r = await extendSubscription(wallet, cfg, { ctx: funded, onLog: say, dryRun });
+
+    // A wallet whose subscription lapsed cannot convert points, so it cannot earn its way back:
+    // no balance -> no renewal -> no convert -> still no balance. Break the deadlock by having a
+    // funded peer send exactly the discounted renewal price, then renew.
+    if (r.reason === 'insufficient-balance' && at.fundSubscription) {
+      const peers = await resolvePeers(wallet, wallets, cfg);
+      const f = await fundSubscription(wallet, peers, cfg, { ctx: funded, onLog: say, dryRun });
+      if (f.skipped) say(`talangi renew skip: ${f.skipped}`);
+      if (f.ok) {
+        const wait = Number(at.settleWaitSec ?? 0);
+        if (wait > 0) { say(`tunggu ${wait}s biar talangan masuk…`); await sleep(wait * 1000); }
+        funded.balances = await getBalances(wallet, cfg).catch(() => funded.balances);
+        r = await extendSubscription(wallet, cfg, { ctx: funded, onLog: say, dryRun });
+        if (r.skipped) say(`extend-subscription skip: ${r.skipped}`);
+        // funded but still not renewed: retry later rather than leaving the money parked
+        if (!r.ok) return { ...r, funded: f.plan, retryable: true };
+        return { ...r, funded: f.plan };
+      }
+      return { ...r, funding: f.skipped, retryable: true };
+    }
+
     if (r.skipped) say(`extend-subscription skip: ${r.skipped}`);
     if (r.ok) funded.balances = await getBalances(wallet, cfg).catch(() => funded.balances);
     return r;

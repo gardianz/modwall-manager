@@ -124,6 +124,7 @@ Fee convert = `claimFeeUsd` tier ($0.20 di tier Basic), **diskon 75% kalau targe
    dan **yang sudah dipegang wallet** lebih dulu, biar saldo menumpuk di satu aset, bukan jadi debu.
 4. **Extend Subscription** — perpanjang tier yang sedang dipakai kalau sisanya sudah
    ≤ `extendWhenDaysLeft`. Dibayar pakai token **diskon** (CBTC/cETH = 75% off, $1.00 → $0.25).
+   Kalau saldonya kurang, bot **menalangi dulu** dari wallet lain yang punya dana (lihat bawah).
 5. **Daily Internal Transfer** — kirim CBTC/cETH senilai `internalTransferUsd` (default $0.01) ke
    **wallet lain yang sudah diimpor ke bot**. Fee dibayar pakai token diskon.
 6. **Claim akhir** — klaim quest yang baru selesai (setelah jeda `settleWaitSec`, karena evaluator
@@ -191,6 +192,9 @@ app (`baseUsd × (1 − diskon%) ÷ harga spot`, dibulatkan ke bawah).
 | `internalTransferUsd` | nilai transfer harian | `0.01` |
 | `convertPreferSymbols` | prioritas target convert | `CBTC,cETH` |
 | `extendSubscription` | auto perpanjang subscription | `true` |
+| `fundSubscription` | talangi wallet yang tak sanggup bayar renew | `true` |
+| `maxFundingUsd` | plafon satu transfer talangan (USD) | `0.5` |
+| `fundingMarginPercent` | kelebihan kiriman, jaga-jaga harga bergerak | `30` |
 | `extendWhenDaysLeft` | extend kalau sisa ≤ segini hari | `3` |
 | `maxSubscriptionUsd` | plafon biaya subscription (USD) | `0.3` |
 | `settleWaitSec` | jeda sebelum claim / setelah convert | `25` |
@@ -201,6 +205,31 @@ app (`baseUsd × (1 − diskon%) ÷ harga spot`, dibulatkan ke bawah).
 > ⚠️ Fee transfer internal ($0.25 base, jadi ~$0.06 dengan diskon 75%) **lebih besar** dari nilai
 > transfer default $0.01. Quest-nya bayar 10 poin (~$0.09). Cek sendiri apakah selisihnya masuk akal
 > buat kamu sebelum menyalakan langkah ini.
+
+### Talangan renew antar wallet
+
+Wallet yang subscription-nya habis **tidak bisa convert poin** — jadi tidak bisa mengumpulkan dana
+sendiri. Buntu: tak ada saldo → tak bisa renew → tak bisa convert → tetap tak ada saldo.
+
+Bot memutusnya: kalau saat renew saldonya kurang, wallet lain yang punya dana mengirimkan
+**tepat sejumlah harga renew** (plus margin `fundingMarginPercent`, karena harga spot bergerak
+antara perhitungan dan saat server menagih), lalu renew dijalankan.
+
+Talangan **selalu memakai aset diskon** (CBTC/cETH). Mengirim CC hanya akan membuat wallet itu
+membayar harga penuh $1.00, bukan $0.25.
+
+```
+harga renew Basic $1.00 per aset:
+  CBTC  0.0000039778  = $0.25 (-75%)
+  cETH  0.000133398   = $0.25 (-75%)
+  CC    10.4166666666 = $1.00 (tanpa diskon)   <- tidak pernah dipakai buat talangan
+
+talangan: $0.325 (harga + margin 30%)  +  fee transfer $0.0625
+```
+
+Syarat: wallet penerima sudah preapproved aset itu (kalau belum, transfer jadi pending
+instruction dan renew tetap gagal) — langkah preapproval di auto task sudah menanganinya lebih dulu.
+Dibatasi `maxFundingUsd` per transfer. Matikan lewat `fundSubscription: false`.
 
 ## Subscription (extend manual)
 

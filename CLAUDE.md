@@ -93,6 +93,12 @@ hari lalu membandingkan `Date.now() >= nextStart`. Jangan diganti jadi cek "apak
 berubah" — tick retry bisa mendarat persis di 00:00, hari sudah berganti padahal
 `loopStartOffsetMin` belum lewat, dan pass berikutnya jalan sebelum quest baru ada di server.
 
+**Subscription lapse = buntu.** Wallet tanpa subscription aktif tidak bisa convert poin, jadi
+tidak bisa mendanai renew-nya sendiri. `runAutoTasks()` memutusnya lewat `fundSubscription()`:
+wallet lain mengirim harga renew dalam **aset diskon** (CBTC/cETH). Jangan menalangi pakai CC/MOD
+— penerima jadi bayar $1.00, bukan $0.25. Pemicunya `reason: 'insufficient-balance'`, **bukan**
+cocok-cocokan teks pesan (teks user-facing bahasa Indonesia, gampang berubah).
+
 **Preapproval wajib duluan.** Token tanpa transfer-preapproval tidak bisa dikirim/diterima
 mulus dan tidak bisa jadi target convert. Itu sebabnya `runAutoTasks()` menjalankan langkah
 preapproval sebelum langkah yang memindahkan nilai.
