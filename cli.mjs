@@ -355,6 +355,7 @@ async function runLoopWithDashboard(sel) {
     columns: DASH_COLUMNS,
   });
   let sched = null;
+  const rowsById = new Map();
   const wib = (t) => new Date(t).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false });
   const left = (t) => { const m = Math.max(0, Math.round((t - Date.now()) / 60000)); return m >= 60 ? `${Math.floor(m / 60)}j${m % 60}m` : `${m}m`; };
 
@@ -382,11 +383,12 @@ async function runLoopWithDashboard(sel) {
       onLog: (m, lvl) => dash.log(m, lvl || logLevel(m)),
       onPersist: persist,
       onSchedule: (s) => { sched = s; paintSummary(); },
+      // Rows are merged by wallet id, not replaced: the loop refreshes a single wallet after it
+      // finishes, and rebuilding the whole table from that one entry would blank the others.
       onStatus: async (list) => {
-        const rows = [];
-        for (const w of list) rows.push(await collectStatus(w, cfg));
+        for (const w of list) rowsById.set(w.id, await collectStatus(w, cfg));
         persist();
-        dash.setRows(rows);
+        dash.setRows(sel.map((w) => rowsById.get(w.id)).filter(Boolean));
         paintSummary();
         dash.render();
       },

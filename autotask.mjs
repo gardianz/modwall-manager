@@ -37,10 +37,19 @@ export async function loadContext(wallet, cfg) {
 // --------------------------------------------------------------------------
 // 1) preapproval — the portfolio "Enable" buttons
 // --------------------------------------------------------------------------
-/** Instruments that are active but not yet preapproved for this wallet. */
+/**
+ * Instruments the transfer-preapproval endpoint refuses outright:
+ *   400 "Transfer preapproval cannot be granted for Amulet or MOD via this endpoint."
+ * The app agrees — the portfolio shows no "Enable" button on Canton Coin or Modulo. They are
+ * granted server-side, and they do show up in the GET list later, so never try to grant them.
+ */
+export const PREAPPROVAL_EXEMPT = ['Amulet', 'MOD'];
+
+/** Instruments that are active, grantable, and not yet preapproved for this wallet. */
 export function missingPreapprovals(instruments, preapproved) {
   return Object.values(instruments)
-    .filter((i) => i.isActive && !preapproved.includes(i.instrumentId))
+    .filter((i) => i.isActive && !preapproved.includes(i.instrumentId)
+      && !PREAPPROVAL_EXEMPT.includes(i.instrumentId))
     .map((i) => ({ symbol: i.symbol, instrumentId: i.instrumentId }));
 }
 
@@ -138,6 +147,28 @@ export function pickConvertTarget(preview, opts = {}) {
 }
 
 /**
+ * Explain a false canExchangePoints using the fields the API actually gives us.
+ *
+ * The server decides this flag and does not say why, so never assert a reason we have not
+ * checked: reporting "poin 250 < minimum 50" when 250 > 50 sends the reader hunting the wrong
+ * problem. Only the conditions visible in the payload are named; anything else is reported as
+ * unknown, with the numbers attached so the real cause can be spotted.
+ */
+export function whyCannotExchange(preview, ctx) {
+  const { pointsBalance: pts, minPoints: min } = preview;
+  if (pts < min) return `poin ${pts} < minimum ${min}`;
+  const done = Number(ctx?.points?.lifetime?.totalPointsExchanged ?? 0);
+  const cap = Number(ctx?.points?.claimable?.pointExchangeMaximumQtyLifetime ?? Infinity);
+  if (done >= cap) return `sudah tukar ${done} poin, mentok batas seumur hidup ${cap}`;
+  const sub = ctx?.sub;
+  const days = sub ? subscriptionDaysRemaining(sub) : 0;
+  if (!sub || sub.status !== 'ACTIVE' || days <= 0) {
+    return `server menolak convert (canExchangePoints=false) — subscription ${sub?.status ?? 'tidak ada'}${sub ? `, sisa ${days}d` : ''}. Poin ${pts} (min ${min}) cukup, jadi kemungkinan besar subscription dulu yang harus aktif.`;
+  }
+  return `server menolak convert (canExchangePoints=false) walau poin ${pts} >= minimum ${min}, subscription ${sub.status} sisa ${days}d — sebab tidak diungkap API`;
+}
+
+/**
  * Convert points into `symbol`, or into the best auto-picked target. Guarded by maxFeeUsd.
  *
  * The payout side is flaky per-asset: a healthy request can come back 503 "Service temporarily
@@ -157,10 +188,8 @@ function isRetryableClaimError(e) {
 export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, onLog = noop, dryRun = false } = {}) {
   const c = ctx || (await loadContext(wallet, cfg));
   const preview = previewConvert(c);
-  if (preview.blocked) return { skipped: 'point exchange diblokir untuk akun ini' };
-  if (!preview.canExchange) {
-    return { skipped: `poin ${preview.pointsBalance} < minimum ${preview.minPoints}` };
-  }
+  if (preview.blocked) return { skipped: 'point exchange diblokir untuk akun ini (flag sybil)' };
+  if (!preview.canExchange) return { skipped: whyCannotExchange(preview, c) };
 
   let targets;
   if (symbol) {
@@ -455,11 +484,14 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
   // Status reads share the wallet objects with the task steps, so they run here, between steps —
   // never on a parallel timer. Two concurrent refreshes would rotate the refresh token against
   // each other and kill the session for good.
-  const status = async () => { if (onStatus) { try { await onStatus(selected); } catch { /* panel only */ } } };
+  const status = async (list = selected) => {
+    if (onStatus) { try { await onStatus(list); } catch { /* panel only, never fail the run */ } }
+  };
 
   for (;;) {
     const day = utcDay();
     onLog(`===== pass harian ${day} (UTC) — ${selected.length} wallet =====`, 'head');
+    await status(); // seed the panel first: an empty table during a long pass reads as broken
     const failed = new Set();
     for (const w of selected) {
       try {
@@ -470,8 +502,8 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
         failed.add(w.id);
       }
       onPersist();
+      await status([w]); // refresh just this row, not the whole table
     }
-    await status();
 
     // Hold until the next quest window. Pinned to an absolute timestamp rather than "has the UTC
     // day changed": a retry tick can land exactly on 00:00, which flips the day while the offset
