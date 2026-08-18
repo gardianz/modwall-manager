@@ -69,7 +69,9 @@ export class Dashboard extends EventEmitter {
     this.rows = [];
     this.summary = [];
     this.logs = [];
-    this.maxLogs = 500;
+    this.channels = [];
+    this.panelIdx = 0;
+    this.maxLogs = 2000;
     this.logLines = logLines;
     this.out = stream;
     this.started = false;
@@ -82,12 +84,27 @@ export class Dashboard extends EventEmitter {
   setRows(rows) { this.rows = rows; this.dirty = true; }
   setSummary(lines) { this.summary = lines.filter(Boolean); this.dirty = true; }
 
-  log(text, level = '') {
+  /**
+   * `channel` names the account a line belongs to; omit it for loop-wide messages.
+   * Lines are stored once and filtered at render time, so switching panels never loses history.
+   */
+  log(text, level = '', channel = null) {
     const t = new Date().toTimeString().slice(0, 8).replace(/:/g, '.');
-    this.logs.push({ t, text: String(text), level });
+    this.logs.push({ t, text: String(text), level, channel });
     if (this.logs.length > this.maxLogs) this.logs.splice(0, this.logs.length - this.maxLogs);
+    if (channel && !this.channels.includes(channel)) this.channels.push(channel);
     this.dirty = true;
     if (this.started) this.render();
+  }
+
+  /** Panel list: the combined view first, then one per account seen so far. */
+  get panels() { return ['SEMUA', ...this.channels]; }
+  get activePanel() { return this.panels[Math.min(this.panelIdx, this.panels.length - 1)]; }
+  cyclePanel(step) {
+    const n = this.panels.length;
+    this.panelIdx = ((this.panelIdx + step) % n + n) % n;
+    this.dirty = true;
+    this.render();
   }
 
   start() {
@@ -100,7 +117,9 @@ export class Dashboard extends EventEmitter {
       process.stdin.resume();
       process.stdin.on('data', this._onKey = (buf) => {
         const k = buf.toString();
-        if (k === 'q' || k === '') this.emit('quit');   // q / Ctrl-C
+        if (k === 'q' || k === '') return void this.emit('quit'); // q / Ctrl-C
+        if (k === '\u001b[A') this.cyclePanel(-1);  // panah atas
+        if (k === '\u001b[B') this.cyclePanel(1);   // panah bawah
       });
     }
     this.timer = setInterval(() => this.render(), 1000).unref?.() ?? this.timer;
@@ -179,15 +198,20 @@ export class Dashboard extends EventEmitter {
 
     // activity log
     lines.push(this._sep(w));
-    const cap = `aktivitas  ${this.logs.length} baris`;
+    const panel = this.activePanel;
+    const shown = panel === 'SEMUA' ? this.logs : this.logs.filter((e) => e.channel === panel);
+    const cap = `log — ${panel}  [↑/↓ ${this.panelIdx + 1}/${this.panels.length}]  ${shown.length} baris`;
     lines.push(this._rowRich(cap, paint(cap, C.head), w));
     const rows = Math.max(3, Math.min(this.logLines, (this.out.rows || 40) - lines.length - 3));
-    for (const e of this.logs.slice(-rows)) {
+    for (const e of shown.slice(-rows)) {
       const col = e.level === 'ok' ? C.ok : e.level === 'warn' ? C.warn
         : e.level === 'err' ? C.err : e.level === 'head' ? C.accent : C.label;
-      const plain = `${e.t} ${e.text}`;
-      const painted = paint(e.t, C.time) + ' ' + paint(clip(e.text, w - 5 - width(e.t)), col);
-      lines.push(this._rowRich(clip(plain, w - 4), painted, w));
+      // the account name is redundant once a per-account panel is selected
+      const body = (panel === 'SEMUA' && e.channel) ? `${e.channel}: ${e.text}` : e.text;
+      const room = w - 5 - width(e.t);
+      const plain = `${e.t} ${clip(body, room)}`;
+      const painted = paint(e.t, C.time) + ' ' + paint(clip(body, room), col);
+      lines.push(this._rowRich(plain, painted, w));
     }
     lines.push(this._bot(w));
 

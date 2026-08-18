@@ -99,6 +99,15 @@ wallet lain mengirim harga renew dalam **aset diskon** (CBTC/cETH). Jangan menal
 — penerima jadi bayar $1.00, bukan $0.25. Pemicunya `reason: 'insufficient-balance'`, **bukan**
 cocok-cocokan teks pesan (teks user-facing bahasa Indonesia, gampang berubah).
 
+**Langkah yang saling membuka harus diulang di pass yang sama.** Renew menghapus persis penyebab
+convert gagal, jadi `runAutoTasks()` menjalankan `daily-convert-ulang` setelah renew sukses —
+dengan `loadContext()` baru, karena `canExchangePoints` ditentukan server. Pemicunya kode
+`reason: 'subscription-inactive'`, bukan teks pesan.
+
+**Log dashboard pakai channel.** `say()` mengirim label wallet sebagai argumen ketiga
+(`onLog(msg, level, channel)`), jangan ditempel ke teks — panel per-akun memfilter lewat channel,
+dan panel `SEMUA` yang menempelkan namanya sendiri saat render.
+
 **Preapproval wajib duluan.** Token tanpa transfer-preapproval tidak bisa dikirim/diterima
 mulus dan tidak bisa jadi target convert. Itu sebabnya `runAutoTasks()` menjalankan langkah
 preapproval sebelum langkah yang memindahkan nilai.

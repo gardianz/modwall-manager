@@ -125,9 +125,12 @@ Fee convert = `claimFeeUsd` tier ($0.20 di tier Basic), **diskon 75% kalau targe
 4. **Extend Subscription** — perpanjang tier yang sedang dipakai kalau sisanya sudah
    ≤ `extendWhenDaysLeft`. Dibayar pakai token **diskon** (CBTC/cETH = 75% off, $1.00 → $0.25).
    Kalau saldonya kurang, bot **menalangi dulu** dari wallet lain yang punya dana (lihat bawah).
-5. **Daily Internal Transfer** — kirim CBTC/cETH senilai `internalTransferUsd` (default $0.01) ke
+5. **Convert ulang** — kalau langkah 3 tadi gagal *karena* subscription mati dan langkah 4 baru
+   saja memperbaikinya, convert diulang di pass yang sama. Poinnya sudah ada; menundanya ke besok
+   tidak ada gunanya.
+6. **Daily Internal Transfer** — kirim CBTC/cETH senilai `internalTransferUsd` (default $0.01) ke
    **wallet lain yang sudah diimpor ke bot**. Fee dibayar pakai token diskon.
-6. **Claim akhir** — klaim quest yang baru selesai (setelah jeda `settleWaitSec`, karena evaluator
+7. **Claim akhir** — klaim quest yang baru selesai (setelah jeda `settleWaitSec`, karena evaluator
    quest jalan async).
 
 Urutannya disengaja: convert dulu supaya ada saldo, subscription sebelum transfer supaya saldonya

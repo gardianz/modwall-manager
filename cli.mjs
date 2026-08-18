@@ -343,7 +343,7 @@ async function runLoopWithDashboard(sel) {
   if (!process.stdout.isTTY) { // piped/logged output: plain lines, no escape soup
     console.log('(bukan TTY — pakai log biasa)');
     await runAutoTasksLoop(sel, wallets, cfg, {
-      onLog: (m) => console.log(`[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${m}`),
+      onLog: (m, _lvl, channel) => console.log(`[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${channel ? channel + ': ' : ''}${m}`),
       onPersist: persist,
     });
     return;
@@ -380,7 +380,7 @@ async function runLoopWithDashboard(sel) {
 
   try {
     await runAutoTasksLoop(sel, wallets, cfg, {
-      onLog: (m, lvl) => dash.log(m, lvl || logLevel(m)),
+      onLog: (m, lvl, channel) => dash.log(m, lvl || logLevel(m), channel),
       onPersist: persist,
       onSchedule: (s) => { sched = s; paintSummary(); },
       // Rows are merged by wallet id, not replaced: the loop refreshes a single wallet after it

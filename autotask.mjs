@@ -156,16 +156,18 @@ export function pickConvertTarget(preview, opts = {}) {
  */
 export function whyCannotExchange(preview, ctx) {
   const { pointsBalance: pts, minPoints: min } = preview;
-  if (pts < min) return `poin ${pts} < minimum ${min}`;
+  if (pts < min) return { reason: 'below-minimum', message: `poin ${pts} < minimum ${min}` };
   const done = Number(ctx?.points?.lifetime?.totalPointsExchanged ?? 0);
   const cap = Number(ctx?.points?.claimable?.pointExchangeMaximumQtyLifetime ?? Infinity);
-  if (done >= cap) return `sudah tukar ${done} poin, mentok batas seumur hidup ${cap}`;
+  if (done >= cap) return { reason: 'lifetime-cap', message: `sudah tukar ${done} poin, mentok batas seumur hidup ${cap}` };
   const sub = ctx?.sub;
   const days = sub ? subscriptionDaysRemaining(sub) : 0;
   if (!sub || sub.status !== 'ACTIVE' || days <= 0) {
-    return `server menolak convert (canExchangePoints=false) — subscription ${sub?.status ?? 'tidak ada'}${sub ? `, sisa ${days}d` : ''}. Poin ${pts} (min ${min}) cukup, jadi kemungkinan besar subscription dulu yang harus aktif.`;
+    return { reason: 'subscription-inactive',
+      message: `server menolak convert (canExchangePoints=false) — subscription ${sub?.status ?? 'tidak ada'}${sub ? `, sisa ${days}d` : ''}. Poin ${pts} (min ${min}) cukup, jadi subscription dulu yang harus aktif.` };
   }
-  return `server menolak convert (canExchangePoints=false) walau poin ${pts} >= minimum ${min}, subscription ${sub.status} sisa ${days}d — sebab tidak diungkap API`;
+  return { reason: 'unknown',
+    message: `server menolak convert (canExchangePoints=false) walau poin ${pts} >= minimum ${min}, subscription ${sub.status} sisa ${days}d — sebab tidak diungkap API` };
 }
 
 /**
@@ -189,7 +191,10 @@ export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, on
   const c = ctx || (await loadContext(wallet, cfg));
   const preview = previewConvert(c);
   if (preview.blocked) return { skipped: 'point exchange diblokir untuk akun ini (flag sybil)' };
-  if (!preview.canExchange) return { skipped: whyCannotExchange(preview, c) };
+  if (!preview.canExchange) {
+    const why = whyCannotExchange(preview, c);
+    return { skipped: why.message, reason: why.reason };
+  }
 
   let targets;
   if (symbol) {
@@ -585,7 +590,7 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
         // a step deferred by a transient outage is not an error, but it still needs another go
         if (rep.errors.length || rep.retryable) failed.add(w.id);
       } catch (e) {
-        onLog(`${walletLabel(w)}: fatal ${e.message}`, 'err');
+        onLog(`fatal ${e.message}`, 'err', walletLabel(w));
         failed.add(w.id);
       }
       onPersist();
@@ -611,12 +616,12 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
           // wallet — never in parallel, or two refreshes rotate the RT against each other.
           await ensureFresh(w, cfg);
           // free and time-critical: bank anything that finished since the last look
-          await claimAllQuests(w, cfg, { onLog: (m) => onLog(`${walletLabel(w)}: ${m}`) });
+          await claimAllQuests(w, cfg, { onLog: (m, lvl) => onLog(m, lvl, walletLabel(w)) });
           if (failed.has(w.id)) {
             const rep = await runAutoTasks(w, wallets, cfg, { onLog });
             if (!rep.errors.length && !rep.retryable) failed.delete(w.id);
           }
-        } catch (e) { onLog(`${walletLabel(w)}: ${e.message}`, 'err'); }
+        } catch (e) { onLog(e.message, 'err', walletLabel(w)); }
         onPersist();
       }
       await status();
@@ -632,19 +637,21 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
 export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun = false } = {}) {
   const label = walletLabel(wallet);
   const at = cfg.autoTask;
-  const say = (m) => onLog(`${label}: ${m}`);
+  // The account name travels as a channel, not glued into the text, so the dashboard can show
+  // one panel per wallet without having to parse it back out of the message.
+  const say = (m, lvl = '') => onLog(m, lvl, label);
   const report = { label, steps: [], errors: [] };
   const step = async (name, enabled, fn) => {
     if (!enabled) { report.steps.push({ name, skipped: 'dimatikan di settings' }); return null; }
     try { const r = await fn(); report.steps.push({ name, ...(r || {}) }); return r; }
-    catch (e) { report.steps.push({ name, error: e.message }); report.errors.push(`${name}: ${e.message}`); say(`${name} error: ${e.message}`); return null; }
+    catch (e) { report.steps.push({ name, error: e.message }); report.errors.push(`${name}: ${e.message}`); say(`${name} error: ${e.message}`, 'err'); return null; }
   };
 
   // A dead refresh token is a normal state in a multi-wallet run, not a crash: report it and
   // let the caller move on to the next wallet.
   try { await ensureFresh(wallet, cfg); }
   catch (e) {
-    say(`sesi mati (${e.message}) — re-import wallet ini`);
+    say(`sesi mati (${e.message}) — re-import wallet ini`, 'err');
     report.errors.push(`sesi: ${e.message}`);
     report.dead = true;
     return report;
@@ -674,11 +681,13 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
   const pending = await pendingDailyWork(wallet, cfg).catch(() => null);
 
   let converted = false;
+  let convertBlockedBySub = false;
   await step('daily-convert', at.dailyConvert, async () => {
     if (pending?.convertDone) { say('daily-convert sudah beres hari ini'); return { skipped: 'sudah beres hari ini' }; }
     const r = await convertPoints(wallet, cfg, { ctx, onLog: say, dryRun });
     if (r.skipped) say(`daily-convert skip: ${r.skipped}`);
     converted = !!r.ok;
+    convertBlockedBySub = r.reason === 'subscription-inactive';
     return r;
   });
 
@@ -691,6 +700,7 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
 
   // Subscription before the transfer: the transfer would otherwise drain the balance that pays
   // for it, and a lapsed subscription stops the quests that make the rest of this worthwhile.
+  let renewed = false;
   await step('extend-subscription', at.extendSubscription, async () => {
     let r = await extendSubscription(wallet, cfg, { ctx: funded, onLog: say, dryRun });
 
@@ -709,13 +719,27 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
         if (r.skipped) say(`extend-subscription skip: ${r.skipped}`);
         // funded but still not renewed: retry later rather than leaving the money parked
         if (!r.ok) return { ...r, funded: f.plan, retryable: true };
+        renewed = true;
         return { ...r, funded: f.plan };
       }
       return { ...r, funding: f.skipped, retryable: true };
     }
 
     if (r.skipped) say(`extend-subscription skip: ${r.skipped}`);
-    if (r.ok) funded.balances = await getBalances(wallet, cfg).catch(() => funded.balances);
+    if (r.ok) { renewed = true; funded.balances = await getBalances(wallet, cfg).catch(() => funded.balances); }
+    return r;
+  });
+
+  // Renewing removes the very thing that blocked the convert, so retry it instead of carrying the
+  // block to tomorrow — the points are already sitting there. canExchangePoints is decided
+  // server-side, so re-read the whole context rather than reusing the pre-renewal snapshot.
+  if (at.dailyConvert && renewed && convertBlockedBySub && !dryRun) await step('daily-convert-ulang', true, async () => {
+    const wait = Number(at.settleWaitSec ?? 0);
+    if (wait > 0) { say(`renew beres — tunggu ${wait}s lalu convert diulang…`); await sleep(wait * 1000); }
+    const fresh = await loadContext(wallet, cfg);
+    const r = await convertPoints(wallet, cfg, { ctx: fresh, onLog: say, dryRun });
+    if (r.skipped) { say(`convert ulang skip: ${r.skipped}`); return { ...r, retryable: true }; }
+    if (r.ok) { converted = true; funded.balances = await getBalances(wallet, cfg).catch(() => funded.balances); }
     return r;
   });
 
