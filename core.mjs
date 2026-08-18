@@ -68,6 +68,7 @@ export function loadConfig() {
       maxFeeUsd: 0.3,            // hard guard: never act when the estimated fee exceeds this
       internalTransferUsd: 0.01, // size of the quest transfer, in USD
       convertPreferSymbols: ['CBTC', 'cETH'], // discounted point-exchange targets
+      convertOnlyDiscounted: true, // never fall back to a non-discounted payout asset
       extendWhenDaysLeft: 3,     // only extend once the subscription is this close to ending
       maxSubscriptionUsd: 0.3,   // hard guard for the subscription payment itself
       settleWaitSec: 25,         // pause before re-polling quests so the evaluator can catch up

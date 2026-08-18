@@ -202,6 +202,15 @@ export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, on
   }
   if (!targets.length) return { skipped: 'tidak ada target convert yang layak (cek preapproval)' };
 
+  // Fall back only across DISCOUNTED assets. Dropping to a full-fee payout to dodge an outage
+  // is a bad trade: at the current rates 106 points net ~$0.96 in CBTC/cETH but ~$0.76 in CC —
+  // a fee 4x higher plus a worse points rate, ~21% of the value gone. If every discounted target
+  // is down we would rather keep the points and try again later.
+  if (!symbol && cfg.autoTask.convertOnlyDiscounted !== false) {
+    const discounted = targets.filter((t) => t.discountPercent > 0);
+    if (discounted.length) targets = discounted;
+  }
+
   const maxFeeUsd = Number(cfg.autoTask.maxFeeUsd ?? Infinity);
   const affordable = targets.filter((t) => t.feeUsd <= maxFeeUsd);
   if (!affordable.length) {
@@ -235,7 +244,8 @@ export async function convertPoints(wallet, cfg, { symbol = null, ctx = null, on
       await sleep(3000);
     }
   }
-  return { skipped: tried.join(' | ') };
+  // every discounted target is sick right now: keep the points, let the watch tick retry
+  return { skipped: `semua target diskon lagi bermasalah — ditunda: ${tried.join(' | ')}`, retryable: true };
 }
 
 // --------------------------------------------------------------------------
@@ -496,7 +506,8 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
     for (const w of selected) {
       try {
         const rep = await runAutoTasks(w, wallets, cfg, { onLog });
-        if (rep.errors.length) failed.add(w.id);
+        // a step deferred by a transient outage is not an error, but it still needs another go
+        if (rep.errors.length || rep.retryable) failed.add(w.id);
       } catch (e) {
         onLog(`${walletLabel(w)}: fatal ${e.message}`, 'err');
         failed.add(w.id);
@@ -527,7 +538,7 @@ export async function runAutoTasksLoop(selected, wallets, cfg, {
           await claimAllQuests(w, cfg, { onLog: (m) => onLog(`${walletLabel(w)}: ${m}`) });
           if (failed.has(w.id)) {
             const rep = await runAutoTasks(w, wallets, cfg, { onLog });
-            if (!rep.errors.length) failed.delete(w.id);
+            if (!rep.errors.length && !rep.retryable) failed.delete(w.id);
           }
         } catch (e) { onLog(`${walletLabel(w)}: ${e.message}`, 'err'); }
         onPersist();
@@ -627,5 +638,6 @@ export async function runAutoTasks(wallet, wallets, cfg, { onLog = noop, dryRun 
     return { claimed: claims.filter((c) => c.ok || c.dryRun).length, claims };
   });
 
+  report.retryable = report.steps.some((st) => st.retryable);
   return report;
 }
