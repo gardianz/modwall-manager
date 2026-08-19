@@ -4,7 +4,7 @@
 // Deliberately NOT automated (cfg.autoTask.skipSlugs): daily-swap and
 // daily-external-cip56-transfer — both cost real value and need a destination the user picks.
 import {
-  api, ensureFresh, walletLabel, truncDecimals, toUnits, fromUnits, fmtUsd,
+  api, ensureFresh, walletLabel, truncDecimals, toUnits, fromUnits, fmtUsd, proxyLabel,
   getInstruments, instrumentBySymbol, instrumentById, getBalances, availableOf,
   getPreapprovals, grantPreapproval, getPoints, getExchangeRates, exchangePoints,
   getClaimableQuests, claimQuest, getQuests, getMyTier, getPartyId, transfer,
@@ -515,7 +515,8 @@ export async function pendingDailyWork(wallet, cfg) {
  */
 export async function collectStatus(wallet, cfg) {
   const row = { label: walletLabel(wallet), status: 'cek…', token: '-', poin: '-', quest: '-',
-    cbtc: '-', ceth: '-', sub: '-', convert: '-', xfer: '-', dead: false };
+    cbtc: '-', ceth: '-', sub: '-', convert: '-', xfer: '-', dead: false,
+    proxy: wallet.proxy ? `${wallet.proxy.host}:${wallet.proxy.port}` : '-' };
   try { await ensureFresh(wallet, cfg); }
   catch { row.status = 'SESI MATI'; row.dead = true; return row; }
   row.token = fmtDur(tokenSecondsLeft(wallet.accessToken));

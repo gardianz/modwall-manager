@@ -100,6 +100,36 @@ Menu:
 
 Data disimpan di `wallets.json` (token) + `config.json` (alert/keeper/autoTask), keduanya `chmod 600`, gitignored.
 
+## Proxy per akun (`proxies.txt`)
+
+Satu baris = satu akun, **urut** sesuai daftar wallet (menu `1`). Baris 1 → wallet 1, dst.
+Salin contohnya: `cp proxies.txt.example proxies.txt`.
+
+```
+198.51.100.10:8080:user1:pass1        # wallet 1
+198.51.100.11:8080:user2:pass2        # wallet 2
+-                                     # wallet 3 sengaja TANPA proxy
+socks5://user3:pass3@198.51.100.12:1080   # wallet 4
+```
+
+Format yang diterima: `host:port`, `host:port:user:pass`, `user:pass@host:port`, dan bentuk
+ber-skema `http://`, `https://`, `socks5://`. Baris `#`/`//` diabaikan.
+
+Pakai `-` untuk melewati satu slot — **jangan baris kosong**, itu bikin urutannya bergeser
+diam-diam. Kalau tidak mau bergantung urutan, ikat langsung ke email:
+
+```
+nama@gmail.com=198.51.100.10:8080:user1:pass1
+```
+
+Semua trafik wallet lewat proxy-nya sendiri, **termasuk refresh token ke Auth0** — bukan cuma
+panggilan API. Kalau hanya API yang diproxy, sesi terlihat berpindah negara di tengah jalan.
+
+Proxy aktif terlihat di menu `1`, menu `3`, dan kolom `PROXY` di dashboard. Baris yang formatnya
+salah dilaporkan (`⚠ proxies.txt: baris N: …`), tidak didiamkan.
+
+> `proxies.txt` **gitignored** — isinya kredensial proxy.
+
 ## Sistem reward: poin → convert → quest
 
 Reward Modulo sekarang berbasis **poin**: kerjakan quest → dapat poin → convert poin jadi token.

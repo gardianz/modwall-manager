@@ -4,6 +4,7 @@ import path from 'node:path';
 import net from 'node:net';
 import dns from 'node:dns';
 import { fileURLToPath } from 'node:url';
+import { proxyFetch, loadProxyFile, assignProxies, proxyLabel } from './proxy.mjs';
 
 // Some hosts (WSL2 in particular) advertise IPv6 but cannot route it. Node's happy-eyeballs
 // then stalls on the API's AAAA record until ETIMEDOUT while curl works fine. Pin IPv4.
@@ -39,6 +40,7 @@ export function log(...a) { console.log(`[${ts()}]`, ...a); }
 // --------------------------------------------------------------------------
 const WALLETS_FILE = path.join(__dirname, 'wallets.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+const PROXY_FILE = path.join(__dirname, 'proxies.txt');
 
 function readJson(file, fallback) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -48,8 +50,39 @@ function writeJsonSecure(file, obj) {
   try { chmodSync(file, 0o600); } catch { /* best effort */ }
 }
 
-export function loadWallets() { const d = readJson(WALLETS_FILE, { wallets: [] }); return Array.isArray(d.wallets) ? d.wallets : []; }
-export function saveWallets(wallets) { writeJsonSecure(WALLETS_FILE, { wallets }); }
+export let proxyErrors = [];
+
+/**
+ * Wallets come back with `.proxy` already attached from proxies.txt — one line per account, in
+ * order — so no caller has to remember to wire it up.
+ */
+export function loadWallets() {
+  const d = readJson(WALLETS_FILE, { wallets: [] });
+  const wallets = Array.isArray(d.wallets) ? d.wallets : [];
+  const file = loadProxyFile(PROXY_FILE);
+  proxyErrors = file.errors;
+  return assignProxies(wallets, file);
+}
+
+/** `proxy` is derived from proxies.txt, so it is never written back into wallets.json. */
+export function saveWallets(wallets) {
+  writeJsonSecure(WALLETS_FILE, { wallets: wallets.map(({ proxy, ...w }) => w) });
+}
+
+/**
+ * The fetch a wallet must use. Cached per wallet, and rebuilt if its proxy line changed, so an
+ * edited proxies.txt takes effect on the next load instead of silently keeping the old exit IP.
+ */
+const fetchCache = new WeakMap();
+export function fetchFor(wallet) {
+  if (!wallet?.proxy) return globalThis.fetch;
+  const hit = fetchCache.get(wallet);
+  if (hit && hit.proxy === wallet.proxy) return hit.fn;
+  const fn = proxyFetch(wallet.proxy);
+  fetchCache.set(wallet, { proxy: wallet.proxy, fn });
+  return fn;
+}
+export { proxyLabel };
 
 export function loadConfig() {
   const d = readJson(CONFIG_FILE, {});
@@ -140,10 +173,10 @@ export function parseImport(text) {
 // --------------------------------------------------------------------------
 // auth0
 // --------------------------------------------------------------------------
-export async function getUserinfo(accessToken, cfg) {
+export async function getUserinfo(accessToken, cfg, wallet = null) {
   const c = apiCfg(cfg);
   try {
-    const res = await fetch(`https://${c.AUTH0_DOMAIN}/userinfo`, {
+    const res = await fetchFor(wallet)(`https://${c.AUTH0_DOMAIN}/userinfo`, {
       headers: { Authorization: `Bearer ${accessToken}`, 'User-Agent': c.UA },
     });
     if (!res.ok) return null;
@@ -155,7 +188,9 @@ export async function getUserinfo(accessToken, cfg) {
 export async function refreshWallet(wallet, cfg) {
   const c = apiCfg(cfg);
   if (!wallet.refreshToken) throw new AuthError('no refresh token for this wallet');
-  const res = await fetch(`https://${c.AUTH0_DOMAIN}/oauth/token`, {
+  // Auth0 must be reached through the same exit IP as the API, or the session looks like it
+  // hopped countries mid-flight.
+  const res = await fetchFor(wallet)(`https://${c.AUTH0_DOMAIN}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': c.UA, Origin: c.ORIGIN },
     body: JSON.stringify({ grant_type: 'refresh_token', client_id: c.AUTH0_CLIENT_ID, refresh_token: wallet.refreshToken }),
@@ -191,7 +226,7 @@ export async function api(wallet, method, ppath, body, cfg) {
     };
     const init = { method, headers };
     if (body !== undefined) { headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
-    return fetch(`${c.API_BASE}${ppath}`, init);
+    return fetchFor(wallet)(`${c.API_BASE}${ppath}`, init);
   };
   let res = await call();
   if ((res.status === 401 || res.status === 403) && wallet.refreshToken) {

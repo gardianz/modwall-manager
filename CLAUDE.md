@@ -45,6 +45,7 @@ di-refactor ke `core.mjs` kecuali diminta.
 | `wallets.json` | array wallet + `accessToken`/`refreshToken` | gitignored, mode 0600 |
 | `config.json` | `alert` (Telegram/webhook), `keeper`, `api` override | gitignored, mode 0600 |
 | `.env` | hanya dipakai `modulo-wallet.mjs` + `grab-token.mjs` | gitignored, mode 0600 |
+| `proxies.txt` | satu proxy per baris, urut = urutan wallet | gitignored |
 
 Tulis lewat `saveWallets()` / `saveConfig()` saja — keduanya lewat `writeJsonSecure()` yang
 mengunci mode 0600. Jangan pernah `writeFileSync` mentah untuk file ini, dan jangan pernah
@@ -107,6 +108,14 @@ dengan `loadContext()` baru, karena `canExchangePoints` ditentukan server. Pemic
 **Log dashboard pakai channel.** `say()` mengirim label wallet sebagai argumen ketiga
 (`onLog(msg, level, channel)`), jangan ditempel ke teks — panel per-akun memfilter lewat channel,
 dan panel `SEMUA` yang menempelkan namanya sendiri saat render.
+
+**Proxy: Node tidak punya hook resmi.** `undici`/`ProxyAgent` tidak bisa diimpor dan
+`NODE_USE_ENV_PROXY` itu se-proses, jadi tak bisa per akun. `proxy.mjs` membuka tunnel sendiri
+(HTTP CONNECT / SOCKS5) lalu menjalankan `https.request` di atasnya. Tunnel **wajib** diserahkan
+lewat subclass Agent — `options.createConnection` + `agent:false` tidak jalan, Node bikin Agent
+sendiri dan request keluar lewat socket yang tak pernah masuk proxy (gejalanya `socket hang up`).
+`refreshWallet()` juga harus lewat proxy yang sama, bukan cuma `api()`. `w.proxy` diturunkan dari
+`proxies.txt` saat `loadWallets()` dan **dibuang** di `saveWallets()` — jangan ikut ke wallets.json.
 
 **Preapproval wajib duluan.** Token tanpa transfer-preapproval tidak bisa dikirim/diterima
 mulus dan tidak bisa jadi target convert. Itu sebabnya `runAutoTasks()` menjalankan langkah

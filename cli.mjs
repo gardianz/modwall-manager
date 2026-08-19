@@ -9,7 +9,7 @@ import {
   getClaimableQuests, claimQuest, getQuests, getMyTier, getExchangeRates, getPoints,
   transfer, planTransfers, pickFeeInstrument, transferFeeUsdFor,
   pickSubscriptionPayment, subscriptionDaysRemaining, EXTEND_WINDOW_DAYS,
-  toUnits, fromUnits, truncDecimals,
+  toUnits, fromUnits, truncDecimals, proxyLabel, proxyErrors,
 } from './core.mjs';
 import {
   loadContext, preapproveAll, missingPreapprovals, previewConvert, pickConvertTarget,
@@ -64,8 +64,9 @@ function listWallets() {
   console.log('\n=== Wallets ===');
   if (!wallets.length) { console.log('(kosong) — pilih "Add wallet".'); return; }
   wallets.forEach((w, i) => {
-    console.log(`  [${i + 1}] ${walletLabel(w).padEnd(28)} ${tokenState(w)}${w.lastError ? '  err: ' + w.lastError : ''}`);
+    console.log(`  [${i + 1}] ${walletLabel(w).padEnd(28)} ${tokenState(w).padEnd(24)} proxy ${proxyLabel(w.proxy)}${w.lastError ? '  err: ' + w.lastError : ''}`);
   });
+  if (proxyErrors.length) console.log('  ⚠ proxies.txt: ' + proxyErrors.join('; '));
 }
 
 async function pickWallet(prompt = 'Nomor wallet') {
@@ -149,6 +150,7 @@ async function showDetail() {
     }
     console.log(`partyId  : ${w.partyId || (await getPartyId(w, cfg).catch(() => '?'))}`);
     console.log(`token    : ${tokenState(w)}`);
+    console.log(`proxy    : ${proxyLabel(w.proxy)}`);
     persist();
   } catch (e) {
     if (e instanceof AuthError) { w.dead = true; w.lastError = e.message; persist(); console.log(`AUTH mati: ${e.message}`); }
@@ -328,6 +330,7 @@ const DASH_COLUMNS = [
   { key: 'sub', label: 'SUB', w: 5, align: 'r', color: (r) => (parseInt(r.sub, 10) <= 3 ? colors.err : colors.ok) },
   { key: 'convert', label: 'CONVERT', w: 7, color: (r) => (r.convert === 'ok' ? colors.ok : colors.dim) },
   { key: 'xfer', label: 'XFER', w: 4, color: (r) => (r.xfer === 'ok' ? colors.ok : colors.dim) },
+  { key: 'proxy', label: 'PROXY', w: 21, color: (r) => (r.proxy === '-' ? colors.dim : colors.num) },
 ];
 
 /** Colour the log line from its own wording, so task code stays free of presentation concerns. */

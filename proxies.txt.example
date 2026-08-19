@@ -1,0 +1,21 @@
+# Satu baris = satu akun, URUT sesuai daftar wallet (menu 1 di CLI).
+# Baris 1 -> wallet 1, baris 2 -> wallet 2, dst.
+#
+# Format yang diterima:
+#   host:port
+#   host:port:user:pass
+#   user:pass@host:port
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+#
+# "-" = wallet di slot itu sengaja TANPA proxy (jangan pakai baris kosong,
+#       nanti urutannya bergeser diam-diam).
+# Baris diawali # atau // diabaikan.
+#
+# Bisa juga mengikat eksplisit ke email, kebal terhadap urutan wallet:
+#   nama@gmail.com=host:port:user:pass
+
+198.51.100.10:8080:user1:pass1
+198.51.100.11:8080:user2:pass2
+-
+socks5://user3:pass3@198.51.100.12:1080
